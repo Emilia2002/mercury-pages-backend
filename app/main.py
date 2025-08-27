@@ -50,10 +50,15 @@ PLAN_LIMITS = {
 
 BRAND_VOICE_LIMIT = 1
 
+origins = [
+    "http://localhost:3000",
+    "https://mercury-pages-frontend.vercel.app",
+    "https://mercurypages.ai"
+]
 # --- CORS Middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development. In production, list your frontend URL.
+    allow_origins=origins,  # For development. In production, list your frontend URL.
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
