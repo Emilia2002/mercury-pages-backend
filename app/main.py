@@ -52,7 +52,7 @@ BRAND_VOICE_LIMIT = 1
 
 origins = [
     "http://localhost:3000",
-    "https://mercury-pages-frontend.vercel.app",
+    "https://mercury-pages-frontend-h4ng6xuw4-emilia2002s-projects.vercel.app",
     "https://mercurypages.ai"
 ]
 # --- CORS Middleware ---
