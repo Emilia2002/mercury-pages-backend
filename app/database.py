@@ -1,7 +1,6 @@
 # FILE: app/database.py
 import os
 
-import console
 from dotenv import load_dotenv
 from pathlib import Path
 from pymongo import MongoClient
