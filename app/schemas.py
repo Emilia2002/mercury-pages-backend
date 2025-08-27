@@ -37,7 +37,9 @@ class UserInDB(BaseModel):
     hashed_password: str
     subscription_plan: str = "free"
     subscription_active: bool = False
-    # Add new subscription fields for the database model
+    pages_generated_month: int = 0
+    current_month: str
+    brand_voice_used: int = 0
     stripe_customer_id: Optional[str] = None
     stripe_subscription_id: Optional[str] = None
 

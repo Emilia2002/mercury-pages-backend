@@ -59,7 +59,7 @@ BRAND_VOICE_LIMIT = 1
 # --- CORS Middleware ---
 origins = [
     "http://localhost:3000",
-    "https://mercury-pages-frontend.vercel.app",  # Asigurați-vă că aceasta este adresa corectă
+    "https://mercury-pages-frontend.vercel.app",
     "https://mercurypages.ai"
 ]
 app.add_middleware(
