@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
 from bson import ObjectId
+from fastapi.responses import JSONResponse
 
 # Import your modules
 import app.database as database
@@ -70,7 +71,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    return JSONResponse(content={"status": "ok"})
 # --- Endpoints ---
 
 @app.get("/")
