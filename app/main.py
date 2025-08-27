@@ -111,12 +111,26 @@ def register_user(user: schemas.UserCreate):
 
 @app.post("/token", response_model=schemas.Token)
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    """Handles user login and returns a JWT."""
-    user = database.get_user_by_email(form_data.username)
-    if not user or not auth.verify_password(form_data.password, user.get('hashed_password')):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password")
-    access_token = auth.create_access_token(data={"sub": user['email']})
-    return {"access_token": access_token, "token_type": "bearer"}
+    print(f"POST /token called for username: {form_data.username}")
+
+    try:
+        user = database.get_user_by_email(form_data.username)
+
+        if not user or not auth.verify_password(form_data.password, user.get('hashed_password')):
+            print(f"Failed login attempt for username: {form_data.username}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        print(f"User {form_data.username} authenticated successfully.")
+        access_token = auth.create_access_token(data={"sub": user['email']})
+        return {"access_token": access_token, "token_type": "bearer"}
+
+    except Exception as e:
+        print(f"CRITICAL ERROR in /token endpoint: {e}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred during login.")
 
 
 @app.post("/create-checkout-session")
