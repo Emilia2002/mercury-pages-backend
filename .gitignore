@@ -1,0 +1,13 @@
+# .gitignore
+
+# Ignore the virtual environment
+venv/
+
+# IDE files
+.idea/
+
+# Ignore Python caches
+__pycache__/
+
+# IGNORE THE FILE WITH SECRETS
+.env
