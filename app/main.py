@@ -58,7 +58,7 @@ try:
     PLAN_LIMITS = {
         "free": {"pages_per_month": 5},
         "craftsman": {"pages_per_month": 30},
-        "artisan": {"pages_per_month": 100},
+        "artisan": {"pages_per_month": None},
         "inventor": {"pages_per_month": None},
     }
 
@@ -139,7 +139,6 @@ try:
             raise HTTPException(status_code=500, detail="An internal server error occurred during login.")
 
 
-    # ... (restul endpoint-urilor dumneavoastră rămân la fel, dar ar trebui să înlocuiți 'print' cu 'logger.info' sau 'logger.error')
     @app.post("/create-checkout-session")
     def create_checkout_session(checkout_request: schemas.CheckoutRequest,
                                 current_user: dict = Depends(auth.get_current_user)):
@@ -191,17 +190,22 @@ try:
         """Creates a scraping job for an authenticated user after checking their plan limits."""
         email = current_user.get("email")
         user = database.get_user_by_email(email)
+        logger.info(f"User authenticated successfully.")
         if not user:
             raise HTTPException(status_code=403, detail="User not found")
 
         plan = user.get("subscription_plan", "free").lower()
+        logger.info(f"User plan: {plan}")
+
         limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+        logger.info(f"User limits: {limits}")
 
         current_month_str = datetime.now(timezone.utc).strftime("%Y-%m")
         if user.get("current_month") != current_month_str:
             database.reset_monthly_usage(email, current_month_str)
             user = database.get_user_by_email(email)
 
+        print(f"User: {user}")
         if limits["pages_per_month"] is not None and user.get("pages_generated_month", 0) >= limits["pages_per_month"]:
             raise HTTPException(status_code=403,
                                 detail="Monthly page generation limit reached. Please upgrade your plan.")
