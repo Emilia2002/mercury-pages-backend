@@ -4,12 +4,14 @@ import traceback
 from datetime import datetime, timezone
 import stripe
 import os
+import httpx
 import json
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, requests, Body
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
+from pydantic import BaseModel
 from bson import ObjectId
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -38,10 +40,13 @@ try:
             doc["_id"] = str(doc["_id"])
         return doc
 
-
     def serialize_docs(docs):
         return [serialize_doc(doc) for doc in docs]
 
+    # --- Pydantic Models ---
+    class ShopifyCredentials(BaseModel):
+        store_url: str
+        access_token: str
 
     # --- Stripe & Plan Config ---
     stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
@@ -247,14 +252,15 @@ try:
             "subscription_plan": plan,
             "subscription_active": user.get("subscription_active", False),
             "pages_limit_month": limits["pages_per_month"],
-            "pages_generated_month": user.get("pages_generated_month", 0)
+            "pages_generated_month": user.get("pages_generated_month", 0),
+            "shopify_store_url": user.get("shopify_store_url"),
+            "shopify_access_token": user.get("shopify_access_token")
         }
 
 
     @app.post("/brand-voice/analyze", response_model=schemas.BrandVoiceAnalyzeResponse)
     def analyze_brand_voice(request: schemas.BrandVoiceAnalyzeRequest,
                             current_user: dict = Depends(auth.get_current_user)):
-        """Analyzes brand description for keywords, platforms, and a sample post."""
         email = current_user.get("email")
         user = database.get_user_by_email(email)
         if user.get("subscription_plan", "free") == "free" and user.get("brand_voice_used", 0) >= BRAND_VOICE_LIMIT:
@@ -305,6 +311,79 @@ try:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     logger.info("🟢 FastAPI app initialization complete. Server is ready.")
+
+
+    @app.post("/users/me/shopify", status_code=status.HTTP_200_OK)
+    async def save_shopify_credentials(
+            creds: ShopifyCredentials,
+            current_user: dict = Depends(auth.get_current_user)
+    ):
+        logger.info(f"Trying to save: {current_user['email']}")
+
+        try:
+            database.users_collection.update_one(
+                {"email": current_user["email"]},
+                {"$set": {
+                    "shopify_store_url": creds.store_url,
+                    "shopify_access_token": creds.access_token
+                }}
+            )
+            logger.info(f"Shopify credentials saved for user: {current_user['email']}")
+            return {"status": "success", "message": "Shopify credentials saved."}
+        except Exception as e:
+            logger.error(f"Error saving Shopify credentials for {current_user['email']}: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error saving credentials.")
+
+    @app.post("/shopify/export", status_code=status.HTTP_201_CREATED)
+    async def export_to_shopify(
+            product: schemas.ProductData,
+            current_user: dict = Depends(auth.get_current_user)
+    ):
+        user = database.get_user_by_email(current_user["email"])
+        store_url = user.get("shopify_store_url")
+        access_token = user.get("shopify_access_token")
+        logger.info(f"Trying to export: {current_user['email']}, {store_url}, {access_token}")
+
+        if not store_url or not access_token:
+            logger.warning(f"Export failed: Shopify credentials not set for user {current_user['email']}")
+            raise HTTPException(
+                status_code=400,
+                detail="Shopify credentials not set. Please complete onboarding."
+            )
+
+        payload = {
+            "product": {
+                "title": product.new_title or product.title or "Untitled",
+                "body_html": product.description or "",
+                "variants": [{"price": product.price or "0.00"}],
+                "images": [{"src": img} for img in (product.images or [])]
+            }
+        }
+
+        # NOTE: Using an async client like 'httpx' is better for FastAPI to avoid blocking the event loop.
+        # This is a blocking call, but is acceptable for a simple example.
+        try:
+            async with httpx.AsyncClient() as client:
+                url = f"https://{store_url}/admin/api/{os.environ.get('SHOPIFY_API_VERSION', '2023-07')}/products.json"
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-Shopify-Access-Token": access_token
+                }
+                resp = await client.post(url, headers=headers, json=payload, timeout=30.0)
+                resp.raise_for_status()  # Raise exception for bad status codes (4xx or 5xx)
+
+            logger.info(f"Successfully exported product to Shopify for user: {current_user['email']}")
+            return {"status": "success", "product": resp.json()}
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error during Shopify export for {current_user['email']}: {e.response.text}")
+            raise HTTPException(status_code=e.response.status_code, detail=f"Shopify API error: {e.response.text}")
+        except httpx.TimeoutException:
+            logger.error("Timeout during Shopify export.")
+            raise HTTPException(status_code=504, detail="Shopify export timed out.")
+        except Exception as e:
+            logger.error(f"Unexpected error during Shopify export for {current_user['email']}: {e}")
+            raise HTTPException(status_code=500, detail="An internal server error occurred during export.")
+
 
 except Exception as e:
     logger.error("❌ CRITICAL STARTUP ERROR:")

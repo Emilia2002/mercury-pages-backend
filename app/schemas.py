@@ -42,6 +42,8 @@ class UserInDB(BaseModel):
     brand_voice_used: int = 0
     stripe_customer_id: Optional[str] = None
     stripe_subscription_id: Optional[str] = None
+    shopify_store_url: Optional[str] = None
+    shopify_access_token: Optional[str] = None
 
 class Token(BaseModel):
     access_token: str
@@ -60,6 +62,8 @@ class UserInfo(BaseModel):
     brand_voice_used: int = 0
     stripe_customer_id: Optional[str] = None
     stripe_subscription_id: Optional[str] = None
+    shopify_store_url: Optional[str] = None
+    shopify_access_token: Optional[str] = None
 
 class BrandVoiceAnalyzeRequest(BaseModel):
     description: str

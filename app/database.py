@@ -127,3 +127,13 @@ def update_user_subscription_status(email: str, plan: str, is_active: bool):
             "stripe_subscription_id": None # <-- Clear the subscription ID
         }}
     )
+
+def update_user_shopify_credentials(email: str, store_url: str, access_token: str):
+    users_collection.update_one(
+        {"email": email},
+        {"$set": {
+            "shopify_store_url": store_url,
+            "shopify_access_token": access_token
+        }}
+    )
+
