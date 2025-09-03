@@ -56,10 +56,6 @@ def generate_product(product_data: dict) -> dict | None:
 
 
 def analyze_brand_description(description: str) -> dict | None:
-    """
-    Analyzes a brand description to extract keywords, recommend social platforms,
-    and generate a sample post.
-    """
     env_path = Path(__file__).resolve().parent.parent / '.env'
     load_dotenv(dotenv_path=env_path)
     api_key = os.environ.get("OPENAI_API_KEY")
