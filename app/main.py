@@ -4,10 +4,8 @@ from datetime import datetime, timezone
 import stripe
 import os
 import httpx
-import asyncio
 import json
-from typing import Any, Dict
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Body, Response
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Body
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -145,61 +143,34 @@ try:
         logger.info("GET / route called")
         return {"message": "Server is running!"}
 
-    async def process_user_creation_in_background(user_data: Dict[str, Any], promo_code: str):
-        try:
-            hashed_password = auth.get_password_hash(user_data["password"])
 
-            subscription_plan = "free"
-
-            final_user_data = {
-                "hashed_password": hashed_password,
-                "subscription_plan": subscription_plan,
-                "subscription_active": True if subscription_plan != "free" else False,
-                "pages_generated_month": 0,
-                "current_month": datetime.now(timezone.utc).strftime("%Y-%m"),
-                "brand_voice_used": 0,
-                "stripe_customer_id": None,
-                "stripe_subscription_id": None,
-            }
-            database.update_user(user_data["_id"], final_user_data)
-            logger.info(f"Background task complete for user: {user_data['email']}")
-        except Exception as e:
-            logger.error(f"Error in background user creation: {e}")
-
-    @app.post("/register")
-    async def register_user(user: schemas.UserCreate, response: Response):
+    @app.post("/register", response_model=schemas.UserInDB)
+    def register_user(user: schemas.UserCreate):
         logger.info(f"POST /register called for email: {user.email}")
         try:
             existing_user = database.get_user_by_email(user.email)
             if existing_user:
                 raise HTTPException(status_code=400, detail="Email already registered")
 
-            temp_user_data = {
-                "first_name": user.first_name,
-                "email": user.email,
-                "password": user.password,
-                "subscription_plan": "pending",
-                "subscription_active": False,
+            user_data = {
+                "first_name": user.first_name, "email": user.email,
+                "hashed_password": auth.get_password_hash(user.password),
+                "subscription_plan": "free", "subscription_active": False,
+                "pages_generated_month": 0, "current_month": datetime.now(timezone.utc).strftime("%Y-%m"),
+                "brand_voice_used": 0, "stripe_customer_id": None, "stripe_subscription_id": None,
             }
-            result = database.create_user(temp_user_data)
+
+            result = database.create_user(user_data)
             if not result:
                 raise HTTPException(status_code=500, detail="Could not create user.")
 
-            user_id = result.inserted_id
-            temp_user_data["_id"] = user_id
-            asyncio.create_task(process_user_creation_in_background(temp_user_data, user.promo_code))
-
-            # Immediately return a 202 Accepted status
-            response.status_code = 202
-            return {"message": "Account creation initiated. Check your email for confirmation."}
-
-        except HTTPException:
-            # Re-raise explicit HTTPExceptions
-            raise
+            created_user = database.get_user_by_email(user.email)
+            return serialize_doc(created_user)
         except Exception as e:
             logger.error(f"Error in /register: {e}")
             traceback.print_exc()
             raise HTTPException(status_code=500, detail="Internal server error during registration.")
+
 
     @app.post("/token", response_model=schemas.Token)
     def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
