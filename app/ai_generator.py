@@ -1,9 +1,9 @@
-# FILE: app/ai_generator.py
 import json
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
 from pathlib import Path
+from typing import Any, Dict, List
 
 def generate_product(product_data: dict) -> dict | None:
     env_path = Path(__file__).resolve().parent.parent / '.env'
@@ -25,13 +25,14 @@ def generate_product(product_data: dict) -> dict | None:
     **Raw Product Data:**
     - Original Title: {product_data.get('title')}
     - Price: {product_data.get('price')}
-    - Available Sizes: {product_data.get('size_info')}
+    - Variants: {product_data.get('variants')}
 
     **Your Tasks:**
     1.  **New Product Title:** Create a catchy, SEO-friendly title (max 60 characters).
     2.  **Product Description:** Write a 2-3 paragraph product description. Start with a hook, explain the benefits, and end with a call to action. Use emojis where appropriate.
     3.  **Bulleted Benefits:** List 3-5 key benefits as a simple list of strings.
-    4.  **Variants:** Generate a JSON object with 'Product Measurements' key. For the 'Product Measurements' key, analyze the provided product measurement information from size information and generate a flat array of measurements. For exemple: Shoulder Width, Bust size, etc.
+    4.  **Variants:** Format the provided variants data into a user-friendly JSON object. For ALL keys (e.g., "Product Measurements", "Size Info", "Color"), the value MUST be a flat array of strings. If the original data is a dictionary (like {{"Bust Size": "..."}}), convert it to a string array like ["Bust Size: ...", "Skirt Length: ..."]. Ensure there are no nested dictionaries or lists within the values.
+
     Return the response ONLY as a valid JSON object with these keys: "new_title", "description", "benefits_list", "variants".
     """
 

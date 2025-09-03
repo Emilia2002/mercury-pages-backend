@@ -13,10 +13,7 @@ def scrape_aliexpress_product(url: str) -> dict | None:
 
         "images": [],
 
-        "color": [],
-
-        "size_info": []
-
+        "variants": {}
     }
 
     with sync_playwright() as p:
@@ -28,6 +25,7 @@ def scrape_aliexpress_product(url: str) -> dict | None:
             page.goto(url, timeout=120000, wait_until='domcontentloaded')
 
             print(f"[{url}] - Pagină încărcată. Extrag datele...")
+
             try:
                 title_selector = "h1[data-pl='product-title']"
                 page.wait_for_selector(title_selector, timeout=10000)
@@ -55,16 +53,20 @@ def scrape_aliexpress_product(url: str) -> dict | None:
             try:
                 color_selector = "div[class*='sku-item--title']"
                 page.wait_for_selector(color_selector, timeout=10000)
-                product_data_raw =  page.locator(color_selector).first.inner_text()
-                product_data['color'] = [el.inner_text().replace("Color:", "").strip()
+                colors = [el.inner_text().replace("Color:", "").strip()
                                          for el in page.locator(color_selector).all()]
+                if colors:
+                    product_data['variants']['Color'] = colors
             except PlaywrightTimeoutError:
                 print("Nu a fost extrasa culoarea")
 
             try:
                 size_info = "div[class*='sku-item--sizeInfo']"
                 page.wait_for_selector(size_info, timeout=10000)
-                product_data['size_info'] = page.locator(size_info).first.inner_text()
+                measurements_str = page.locator(size_info).first.inner_text()
+
+                if measurements_str:
+                    product_data['variants']['Product Measurements'] = measurements_str.split('\n')
             except PlaywrightTimeoutError:
                 print("Nu au fost extrase informatiile marimilor")
 

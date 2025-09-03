@@ -1,4 +1,3 @@
-# FILE: app/main.py
 import logging
 import traceback
 from datetime import datetime, timezone
@@ -6,13 +5,15 @@ import stripe
 import os
 import httpx
 import json
-from fastapi import FastAPI, Depends, HTTPException, status, Request, requests, Body
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Body
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
 from pydantic import BaseModel
 from bson import ObjectId
+from itertools import product
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logger.info("--- Starting main.py initialization ---")
@@ -40,13 +41,62 @@ try:
             doc["_id"] = str(doc["_id"])
         return doc
 
+
     def serialize_docs(docs):
         return [serialize_doc(doc) for doc in docs]
+
+
+    # Helper function to transform variants data for Shopify
+    def _transform_to_shopify_variants(product_data: schemas.ProductData):
+        options = []
+        variants = []
+
+        # Use a list of tuples to maintain the order of variants (e.g., Color then Size)
+        variant_data = list(product_data.variants.items())
+
+        if not variant_data:
+            # If no variants, return a single default variant
+            return {
+                "options": [{"name": "Title", "values": ["Default Title"]}],
+                "variants": [{
+                    "price": product_data.price,
+                    "title": "Default Title",
+                    "option1": "Default Title"
+                }]
+            }
+
+        for idx, (name, values) in enumerate(variant_data):
+            options.append({
+                "name": name,
+                "values": values
+            })
+
+        # Generate all variant combinations (Cartesian product)
+        option_values_sets = [values for _, values in variant_data]
+        combinations = list(product(*option_values_sets))
+
+        # Create the variants list
+        for combo in combinations:
+            variant = {
+                "price": product_data.price,
+                "title": " / ".join(combo)
+            }
+            for i, value in enumerate(combo):
+                variant[f"option{i + 1}"] = value
+
+            variants.append(variant)
+
+        return {
+            "options": options,
+            "variants": variants
+        }
+
 
     # --- Pydantic Models ---
     class ShopifyCredentials(BaseModel):
         store_url: str
         access_token: str
+
 
     # --- Stripe & Plan Config ---
     stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
@@ -210,7 +260,6 @@ try:
             database.reset_monthly_usage(email, current_month_str)
             user = database.get_user_by_email(email)
 
-        print(f"User: {user}")
         if limits["pages_per_month"] is not None and user.get("pages_generated_month", 0) >= limits["pages_per_month"]:
             raise HTTPException(status_code=403,
                                 detail="Monthly page generation limit reached. Please upgrade your plan.")
@@ -310,6 +359,8 @@ try:
             return {"status": "success", "message": "Subscription cancelled successfully."}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+
     logger.info("🟢 FastAPI app initialization complete. Server is ready.")
 
 
@@ -334,6 +385,7 @@ try:
             logger.error(f"Error saving Shopify credentials for {current_user['email']}: {e}")
             raise HTTPException(status_code=500, detail="Internal server error saving credentials.")
 
+
     @app.post("/shopify/export", status_code=status.HTTP_201_CREATED)
     async def export_to_shopify(
             product: schemas.ProductData,
@@ -351,17 +403,19 @@ try:
                 detail="Shopify credentials not set. Please complete onboarding."
             )
 
+        # --- THE FIX IS HERE ---
+        # Transform the product data into Shopify's required format
+        shopify_variants_data = _transform_to_shopify_variants(product)
+
         payload = {
             "product": {
                 "title": product.new_title or product.title or "Untitled",
                 "body_html": product.description or "",
-                "variants": [{"price": product.price or "0.00"}],
-                "images": [{"src": img} for img in (product.images or [])]
+                "images": [{"src": img} for img in (product.images or [])],
+                **shopify_variants_data  # Unpack the options and variants directly into the payload
             }
         }
 
-        # NOTE: Using an async client like 'httpx' is better for FastAPI to avoid blocking the event loop.
-        # This is a blocking call, but is acceptable for a simple example.
         try:
             async with httpx.AsyncClient() as client:
                 url = f"https://{store_url}/admin/api/{os.environ.get('SHOPIFY_API_VERSION', '2023-07')}/products.json"
@@ -370,7 +424,7 @@ try:
                     "X-Shopify-Access-Token": access_token
                 }
                 resp = await client.post(url, headers=headers, json=payload, timeout=30.0)
-                resp.raise_for_status()  # Raise exception for bad status codes (4xx or 5xx)
+                resp.raise_for_status()
 
             logger.info(f"Successfully exported product to Shopify for user: {current_user['email']}")
             return {"status": "success", "product": resp.json()}
