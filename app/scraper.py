@@ -1,82 +1,31 @@
-import json
-import re
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import httpx
+from bs4 import BeautifulSoup
+from typing import List
+from urllib.parse import urljoin, urlparse
 
-BROWSER_API_WSS = "wss://brd-customer-hl_31a47ad1-zone-scraping_browser1:r1rnojcfexvj@brd.superproxy.io:9222"
 
-def scrape_aliexpress_product(url: str) -> dict | None:
-    product_data = {
+def scrape_images_only(url: str) -> List[str]:
 
-        "title": None,
+    try:
+        response = httpx.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-        "price": None,
+        image_urls = []
+        image_tags = soup.find_all('img')
 
-        "images": [],
+        for img in image_tags:
+            src = img.get('src')
+            if src:
+                absolute_url = urljoin(url, src)
+                if urlparse(absolute_url).scheme in ['http', 'https']:
+                    image_urls.append(absolute_url)
 
-        "variants": {}
-    }
+        return image_urls
 
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(BROWSER_API_WSS)
-        page = browser.new_page()
-
-        try:
-            print(f"[{url}] - Navighez prin Browser API...")
-            page.goto(url, timeout=120000, wait_until='domcontentloaded')
-
-            print(f"[{url}] - Pagină încărcată. Extrag datele...")
-
-            try:
-                title_selector = "h1[data-pl='product-title']"
-                page.wait_for_selector(title_selector, timeout=10000)
-                product_data['title'] = page.locator(title_selector).inner_text()
-            except PlaywrightTimeoutError:
-                print("Title not extracted")
-
-            try:
-                price_selector = "span[class*='price-default--current']"
-                page.wait_for_selector(price_selector, timeout=10000)
-                pret_brut = page.locator(price_selector).first.inner_text()
-                if pret_brut:
-                    product_data['price'] = ''.join(filter(lambda char: char.isdigit() or char in ',.', pret_brut))
-            except PlaywrightTimeoutError:
-                print("Price not extracted")
-
-            try:
-                image_container_selector = "div[class*='main-image--wrap']"
-                page.wait_for_selector(image_container_selector, timeout=5000)
-                image_elements = page.locator(f"{image_container_selector} img")
-                product_data['images'] = [img.get_attribute("src") for img in image_elements.all()]
-            except PlaywrightTimeoutError:
-                print("Images not extracted")
-
-            try:
-                color_selector = "div[class*='sku-item--title']"
-                page.wait_for_selector(color_selector, timeout=10000)
-                colors = [el.inner_text().replace("Color:", "").strip()
-                                         for el in page.locator(color_selector).all()]
-                if colors:
-                    product_data['variants']['Color'] = colors
-            except PlaywrightTimeoutError:
-                print("Nu a fost extrasa culoarea")
-
-            try:
-                size_info = "div[class*='sku-item--sizeInfo']"
-                page.wait_for_selector(size_info, timeout=10000)
-                measurements_str = page.locator(size_info).first.inner_text()
-
-                if measurements_str:
-                    product_data['variants']['Product Measurements'] = measurements_str.split('\n')
-            except PlaywrightTimeoutError:
-                print("Nu au fost extrase informatiile marimilor")
-
-            print(f"✅ - Data extracted successfully!")
-            print(product_data)
-            return product_data
-
-        except Exception as e:
-            print(f"❌ [{url}] - Scraper error: {e}")
-            return None
-        finally:
-            browser.close()
-            print(f"[{url}] - Browser closed.")
+    except httpx.RequestError as e:
+        print(f"Scraper Error: Failed to access URL {url}. Reason: {e}")
+        return []
+    except Exception as e:
+        print(f"Scraper Error: An unexpected error occurred during scraping: {e}")
+        return []

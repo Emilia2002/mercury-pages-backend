@@ -3,7 +3,7 @@ import os
 
 from dotenv import load_dotenv
 from pathlib import Path
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from bson.objectid import ObjectId
 from datetime import datetime, timezone
 

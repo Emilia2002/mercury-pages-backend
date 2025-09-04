@@ -1,4 +1,3 @@
-# FILE: app/main.py
 import logging
 import traceback
 from datetime import datetime, timezone
@@ -11,18 +10,24 @@ from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+from typing import List, Dict, Any
+
+from openai import OpenAI
 from pydantic import BaseModel
 from bson import ObjectId
+
+from app import ai_generator
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logger.info("--- Starting main.py initialization ---")
 
 try:
-    # Import your modules
     import app.database as database
     import app.schemas as schemas
     import app.auth as auth
-    import app.ai_generator as ai_generator
 
     logger.info("✅ Modules imported successfully.")
 
@@ -40,18 +45,64 @@ try:
             doc["_id"] = str(doc["_id"])
         return doc
 
+
     def serialize_docs(docs):
         return [serialize_doc(doc) for doc in docs]
+
+
+    def scrape_images_only(url: str) -> List[str]:
+
+        try:
+            response = httpx.get(url, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            image_urls = []
+            image_tags = soup.find_all('img')
+
+            for img in image_tags:
+                src = img.get('src')
+                if src:
+                    absolute_url = urljoin(url, src)
+                    if urlparse(absolute_url).scheme in ['http', 'https']:
+                        image_urls.append(absolute_url)
+
+            return image_urls
+
+        except httpx.RequestError as e:
+            print(f"Scraper Error: Failed to access URL {url}. Reason: {e}")
+            return []
+        except Exception as e:
+            print(f"Scraper Error: An unexpected error occurred during scraping: {e}")
+            return []
+
 
     # --- Pydantic Models ---
     class ShopifyCredentials(BaseModel):
         store_url: str
         access_token: str
 
+
+    class AIExtractRequest(BaseModel):
+        source_url: str
+
+
+    class AIExtractResponse(BaseModel):
+        original_title: str
+        new_title: str
+        description: str
+        images: list[str]
+        variants: list[str]
+        price: str
+        category: str
+        availability: bool
+
+
     # --- Stripe & Plan Config ---
     stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
     YOUR_DOMAIN = os.environ.get("FRONTEND_URL", "http://localhost:3000")
     STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
     logger.info("✅ Stripe config loaded.")
 
     PRICE_IDS = {
@@ -219,6 +270,106 @@ try:
         return {"message": "Scraping job created", "job_id": job_id}
 
 
+    @app.post("/ai-extract-data", response_model=AIExtractResponse)
+    async def extract_data_with_ai(request: AIExtractRequest, current_user: dict = Depends(auth.get_current_user)):
+        email = current_user.get("email")
+        # Step 0: create a job in 'pending' state
+        job_id = database.create_scraping_job(request.source_url, email)
+
+        try:
+            url = request.source_url
+            logger.info(f"Job {job_id}: Extracting data from URL: {url}")
+
+            # Step 1: Scrape images
+            scraped_images = scrape_images_only(url)
+            logger.info(f"Job {job_id}: Image scraping successful")
+
+            # Step 2: Gemini extraction
+            async with httpx.AsyncClient() as client:
+                gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={GEMINI_API_KEY}"
+                gemini_response_schema = {
+                    "type": "OBJECT",
+                    "properties": {
+                        "title": {"type": "STRING"},
+                        "variants": {"type": "ARRAY", "items": {"type": "STRING"}},
+                        "price": {"type": "STRING"},
+                        "category": {"type": "STRING"},
+                        "availability": {"type": "BOOLEAN"}
+                    },
+                    "propertyOrdering": ["title", "variants", "price", "category", "availability"]
+                }
+                gemini_payload = {
+                    "contents": [{"parts": [{"text": f"Extract structured data from the product page URL: {url}"}]}],
+                    "generationConfig": {"responseMimeType": "application/json",
+                                         "responseSchema": gemini_response_schema}
+                }
+                gemini_resp = await client.post(gemini_api_url, json=gemini_payload, timeout=30.0)
+                gemini_resp.raise_for_status()
+                gemini_data_str = gemini_resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[
+                    0].get("text")
+                if not gemini_data_str:
+                    raise HTTPException(status_code=500, detail="Gemini API returned no data")
+                gemini_data = json.loads(gemini_data_str)
+                logger.info(f"Job {job_id}: Gemini extraction successful")
+
+            # Step 3: OpenAI copywriting
+            openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            openai_prompt = f"""
+                Act as an expert Shopify copywriter. Transform the raw product data into a compelling product page description and title.
+                Raw data: {json.dumps(gemini_data, indent=2)}
+                Return JSON with keys: 'new_title', 'description', 'benefits_list'.
+            """
+            openai_resp = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that outputs JSON."},
+                    {"role": "user", "content": openai_prompt}
+                ]
+            )
+            openai_data = json.loads(openai_resp.choices[0].message.content)
+            logger.info(f"Job {job_id}: OpenAI generation successful")
+
+            # Gemini returns a list like ["50 ML", "100 ML"]
+            gemini_variants = gemini_data.get("variants", [])
+
+            # Wrap it in a dict for Pydantic
+            variants_dict = {"Option": gemini_variants}
+
+            # Step 4: Combine data
+            final_response_data = {
+                "original_title": gemini_data.get("title", "Untitled Product"),
+                "new_title": openai_data.get("new_title", "Untitled Product"),
+                "description": openai_data.get("description", ""),
+                "images": scraped_images,
+                "variants": variants_dict,
+                "price": gemini_data.get("price", "N/A"),
+                "category": gemini_data.get("category", "Uncategorized"),
+                "availability": gemini_data.get("availability", False)
+            }
+
+            # Step 5: Update job with results
+            database.update_job_with_result(ObjectId(job_id), final_response_data)
+            logger.info(f"Job {job_id}: Completed successfully")
+
+            response = {
+                "original_title": gemini_data.get("title", "Untitled Product"),
+                "new_title": openai_data.get("new_title", "Untitled Product"),
+                "description": openai_data.get("description", ""),
+                "images": scraped_images,
+                "variants": gemini_variants,  # list for API
+                "price": gemini_data.get("price", "N/A"),
+                "category": gemini_data.get("category", "Uncategorized"),
+                "availability": gemini_data.get("availability", False)
+            }
+            return response
+
+        except Exception as e:
+            logger.error(f"Job {job_id}: Failed with error: {e}")
+            database.update_job_with_error(ObjectId(job_id), str(e))
+            raise HTTPException(status_code=500, detail=f"AI extraction failed: {str(e)}")
+
+
     @app.get("/jobs/{job_id}", response_model=schemas.Job)
     def get_job_status(job_id: str, current_user: dict = Depends(auth.get_current_user)):
         """Retrieves the status and result of a single job."""
@@ -309,6 +460,8 @@ try:
             return {"status": "success", "message": "Subscription cancelled successfully."}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+
     logger.info("🟢 FastAPI app initialization complete. Server is ready.")
 
 
@@ -333,11 +486,43 @@ try:
             logger.error(f"Error saving Shopify credentials for {current_user['email']}: {e}")
             raise HTTPException(status_code=500, detail="Internal server error saving credentials.")
 
+
+    def generate_shopify_variants(variants_dict: Dict[str, List[str]]):
+        """Generates Shopify-compatible options and variants from a dictionary."""
+        options = []
+        variants = []
+        option_names = list(variants_dict.keys())
+
+        # Create the 'options' array
+        for name, values in variants_dict.items():
+            options.append({"name": name, "values": values})
+
+        # Generate the Cartesian product of all variant values
+        def generate_combinations(keys, index, current_combination):
+            if index == len(keys):
+                variants.append(current_combination)
+                return
+
+            current_key = keys[index]
+            for value in variants_dict[current_key]:
+                new_combination = current_combination.copy()
+                new_combination[f"option{index + 1}"] = value
+                generate_combinations(keys, index + 1, new_combination)
+
+        generate_combinations(option_names, 0, {})
+
+        # Add price to each variant
+        for variant in variants:
+            variant["price"] = "1.00"  # Default price, you might want to customize this
+
+        return options, variants
+
     @app.post("/shopify/export", status_code=status.HTTP_201_CREATED)
     async def export_to_shopify(
             product: schemas.ProductData,
             current_user: dict = Depends(auth.get_current_user)
     ):
+        logger.info("Trying to export...")
         user = database.get_user_by_email(current_user["email"])
         store_url = user.get("shopify_store_url")
         access_token = user.get("shopify_access_token")
@@ -350,11 +535,15 @@ try:
                 detail="Shopify credentials not set. Please complete onboarding."
             )
 
+        # Generate options and variants from the input data
+        options, variants = generate_shopify_variants(product.variants)
+
         payload = {
             "product": {
                 "title": product.new_title or product.title or "Untitled",
                 "body_html": product.description or "",
-                "variants": [{"size": product.variants or ""}],
+                "options": options,
+                "variants": variants,
                 "images": [{"src": img} for img in (product.images or [])]
             }
         }
@@ -366,7 +555,7 @@ try:
                     "Content-Type": "application/json",
                     "X-Shopify-Access-Token": access_token
                 }
-                resp = await client.post(url, headers=headers, json=payload, timeout=30.0)
+                resp = await client.post(url, headers=headers, json=payload, timeout=60.0)
                 resp.raise_for_status()
 
             logger.info(f"Successfully exported product to Shopify for user: {current_user['email']}")
