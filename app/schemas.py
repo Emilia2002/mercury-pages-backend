@@ -1,6 +1,7 @@
 # FILE: app/schemas.py
 from pydantic import BaseModel, HttpUrl, EmailStr, Field
 from typing import List, Optional, Dict
+from datetime import datetime
 
 class ScrapeRequest(BaseModel):
     source_url: HttpUrl
@@ -10,19 +11,26 @@ class ProductData(BaseModel):
     price: Optional[str] = None
     images: List[str] = []
     variants: Dict[str, List[str]] = {}
-    new_title: Optional[str] = None
     description: Optional[str] = None
     benefits_list: Optional[List[str]] = None
 
 class Job(BaseModel):
     id: str = Field(..., alias="_id")
-    url: str
     user_email: str
+    type: str  # This is a required field
     status: str
+    url: Optional[str] = None
     result: Optional[ProductData] = None
     error: Optional[str] = None
+    created_at: Optional[datetime] = None
 
     class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+
+
+
+class Config:
         populate_by_name = True
         arbitrary_types_allowed = True
 

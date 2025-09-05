@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import traceback
 from datetime import datetime, timezone
@@ -6,33 +7,27 @@ import os
 import httpx
 import json
 from urllib.parse import urljoin, urlparse
-from typing import List
-from fastapi import FastAPI, Depends, HTTPException, status, Request, requests, Body
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Body
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from typing import List, Dict, Any
-
 from openai import OpenAI
 from pydantic import BaseModel
 from bson import ObjectId
 
-from app import ai_generator
+import app.database as database
+import app.schemas as schemas
+import app.auth as auth
+import app.ai_generator as ai_generator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logger.info("--- Starting main.py initialization ---")
 
 try:
-    import app.database as database
-    import app.schemas as schemas
-    import app.auth as auth
-
-    logger.info("✅ Modules imported successfully.")
-
     # Load environment variables
     env_path = Path(__file__).resolve().parent.parent / '.env'
     load_dotenv(dotenv_path=env_path)
@@ -52,11 +47,94 @@ try:
         return [serialize_doc(doc) for doc in docs]
 
 
+    def flatten_variants(variants_raw) -> list[str]:
+        """Normalize any variant format into a flat list of strings."""
+        if isinstance(variants_raw, dict):
+            # dict format: {"Size": ["S", "M"]}
+            return [f"{name}: {opt}" for name, opts in variants_raw.items() for opt in opts]
+
+        elif isinstance(variants_raw, list):
+            result = []
+            for item in variants_raw:
+                if isinstance(item, dict):
+                    # list of dicts: [{"variant_name": "Size", "options": ["S","M"]}]
+                    name = item.get("variant_name") or item.get("name") or "Option"
+                    for opt in item.get("options", []):
+                        result.append(f"{name}: {opt}")
+                elif isinstance(item, str):
+                    result.append(item)
+            return result
+
+        elif isinstance(variants_raw, str):
+            return [variants_raw]
+
+        return []
+
+
+    def extract_images(soup: BeautifulSoup, base_url: str) -> list[str]:
+        images = set()
+
+        for img in soup.find_all('img'):
+            for attr in ["src", "data-src", "data-image", "data-lazy-src", "data-original", "srcset"]:
+                val = img.get(attr)
+                if val:
+                    # Handle srcset (take the first URL)
+                    if " " in val and "http" in val:
+                        val = val.split(" ")[0]
+                    absolute_url = urljoin(base_url, val)
+                    if urlparse(absolute_url).scheme in ["http", "https"]:
+                        images.add(absolute_url)
+
+        # 2. AliExpress JSON blob (product gallery often stored here)
+        for script in soup.find_all("script"):
+            if script.string and "window.runParams" in script.string:
+                try:
+                    import re, json
+                    match = re.search(r'window\.runParams\s*=\s*(\{.*\});', script.string, re.DOTALL)
+                    if match:
+                        data = json.loads(match.group(1))
+                        # AliExpress stores product images under multiple possible keys
+                        gallery = data.get("data", {}).get("imageModule", {}).get("imagePathList", [])
+                        if gallery:
+                            for img_url in gallery:
+                                images.add(img_url)
+                except Exception:
+                    pass
+
+        return list(images)
+
+
+    def normalize_variants(variants_raw):
+        """
+        Converts variants into Dict[str, List[str]] format.
+        Handles cases where database stores list of dicts.
+        """
+        if isinstance(variants_raw, dict):
+            normalized = {}
+            for key, values in variants_raw.items():
+                # flatten dicts in the list into strings
+                str_values = []
+                for v in values:
+                    if isinstance(v, dict):
+                        # pick first value in dict
+                        str_values.append(next(iter(v.values())))
+                    elif isinstance(v, str):
+                        str_values.append(v)
+                normalized[key] = str_values
+            return normalized
+        elif isinstance(variants_raw, list):
+            normalized = {}
+            for item in variants_raw:
+                if isinstance(item, dict):
+                    name = item.get("variant_name") or item.get("name") or "Option"
+                    options = item.get("options") or []
+                    normalized[name] = [str(opt) for opt in options]
+            return normalized
+        return {"default": ["Default"]}
+
+
     def extract_product_data(html_content: str, base_url: str) -> dict:
-        """
-        Extracts key product data from HTML using heuristics.
-        Returns a dictionary with extracted data.
-        """
+
         soup = BeautifulSoup(html_content, 'html.parser')
         data = {
             "original_title": "Untitled Product",
@@ -67,14 +145,7 @@ try:
             "availability": True,
         }
 
-        # 1. Extract Images
-        imgs = soup.find_all('img')
-        for img in imgs:
-            src = img.get('src')
-            if src:
-                absolute_url = urljoin(base_url, src)
-                if urlparse(absolute_url).scheme in ["http", "https"]:
-                    data["images"].append(absolute_url)
+        data["images"] = extract_images(soup, base_url)
 
         # 2. Extract Title (look for meta tags or h1)
         title_tag = soup.find('meta', property='og:title')
@@ -137,6 +208,7 @@ try:
         variants: list[str]
         price: str
         category: str
+        benefits_list: list[str]  # Added to match the returned data
         availability: bool
 
 
@@ -330,7 +402,7 @@ try:
             async with httpx.AsyncClient() as client:
                 scrape_do_url = f"https://api.scrape.do/?url={clean_url}&token={SCRAPE_DO_API}&render=true"
                 logger.info(f"Job {job_id}: Making Scrape.do API call to {scrape_do_url}")
-                scrape_resp = await client.get(scrape_do_url, timeout=30.0)
+                scrape_resp = await client.get(scrape_do_url, timeout=60.0)
                 scrape_resp.raise_for_status()
 
                 # Extract all data from the HTML
@@ -341,10 +413,28 @@ try:
             # Step 2: OpenAI copywriting
             openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
             openai_prompt = f"""
-                Act as an expert Shopify copywriter. Transform the raw product data into a compelling product page description and new title. Make it sound professional and user-friendly. 
-                Raw data: {json.dumps(extracted_data, indent=2)}
-                Return JSON with keys: 'new_title', 'description', 'benefits_list'.
+            You are an expert Shopify product page generator.
+            Take the raw product data and generate a **Shopify-ready product object**.
+
+            Tasks:
+            1. Rewrite the product title into something unique, attractive, and keyword-friendly.
+            2. Write a persuasive long-form product description (with emojis if relevant).
+            3. Create a short **benefits list** in bullet points.
+            4. If the category is missing or 'Uncategorized', infer the best category (e.g. 'Electronics', 'Fashion', 'Home & Kitchen', 'Sports', etc.).
+            5. If variants are missing or only 'default', analyze the data and guess meaningful variants (size, color, material, style, etc.).
+            6. Always return **valid JSON**.
+
+            Raw extracted data:
+            {json.dumps(extracted_data, indent=2)}
+
+            Return JSON with keys:
+            - new_title
+            - description
+            - benefits_list
+            - category
+            - variants
             """
+
             openai_resp = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 response_format={"type": "json_object"},
@@ -356,34 +446,22 @@ try:
             openai_data = json.loads(openai_resp.choices[0].message.content)
             logger.info(f"Job {job_id}: OpenAI generation successful")
 
-            # Step 3: Combine data
             final_response_data = {
                 "original_title": extracted_data.get("original_title", "Untitled Product"),
                 "new_title": openai_data.get("new_title", "Untitled Product"),
                 "description": openai_data.get("description", ""),
                 "images": extracted_data.get("images", []),
-                "variants": extracted_data.get("variants", {}),
+                "variants": flatten_variants(openai_data.get("variants") or extracted_data.get("variants", {})),
                 "price": extracted_data.get("price", "N/A"),
-                "category": extracted_data.get("category", "Uncategorized"),
-                "availability": extracted_data.get("availability", False)
+                "category": openai_data.get("category", "Uncategorized"),
+                "benefits_list": openai_data.get("benefits_list", []),
+                "availability": extracted_data.get("availability", False),
             }
 
-            # Step 4: Update job with results
             database.update_job_with_result(ObjectId(job_id), final_response_data)
             logger.info(f"Job {job_id}: Completed successfully")
 
-            response = {
-                "original_title": extracted_data.get("original_title", "Untitled Product"),
-                "new_title": openai_data.get("new_title", "Untitled Product"),
-                "description": openai_data.get("description", ""),
-                "images": extracted_data.get("images", []),
-                "variants": list(extracted_data.get("variants", {}).values())[0] if extracted_data.get("variants",
-                                                                                                       {}) else [],
-                "price": extracted_data.get("price", "N/A"),
-                "category": extracted_data.get("category", "Uncategorized"),
-                "availability": extracted_data.get("availability", False)
-            }
-            return response
+            return final_response_data
 
         except Exception as e:
             logger.error(f"Job {job_id}: Failed with error: {e}")
@@ -483,36 +561,28 @@ try:
             raise HTTPException(status_code=500, detail=str(e))
 
 
-    logger.info("🟢 FastAPI app initialization complete. Server is ready.")
-
-
-    @app.post("/users/me/shopify", status_code=status.HTTP_200_OK)
-    async def save_shopify_credentials(
-            creds: ShopifyCredentials,
-            current_user: dict = Depends(auth.get_current_user)
-    ):
-        logger.info(f"Trying to save: {current_user['email']}")
-
-        try:
-            database.users_collection.update_one(
-                {"email": current_user["email"]},
-                {"$set": {
-                    "shopify_store_url": creds.store_url,
-                    "shopify_access_token": creds.access_token
-                }}
-            )
-            logger.info(f"Shopify credentials saved for user: {current_user['email']}")
-            return {"status": "success", "message": "Shopify credentials saved."}
-        except Exception as e:
-            logger.error(f"Error saving Shopify credentials for {current_user['email']}: {e}")
-            raise HTTPException(status_code=500, detail="Internal server error saving credentials.")
-
-
-    def generate_shopify_variants(variants_dict: Dict[str, List[str]]):
-        """Generates Shopify-compatible options and variants from a dictionary."""
+    def generate_shopify_variants(variants_dict: Dict[str, List[str]], base_price: str):
+        """Generates Shopify-compatible options and variants from a dictionary.
+        Limits the total number of variants to 250 and options to 3."""
         options = []
         variants = []
         option_names = list(variants_dict.keys())
+
+        # Shopify has a hard limit of 250 variants per product
+        max_variants = 250
+        # And a hard limit of 3 options
+        max_options = 3
+
+        if len(option_names) > max_options:
+            logger.warning(f"Warning: Truncating variants to {max_options} to comply with Shopify's limit.")
+            option_names = option_names[:max_options]
+            # Rebuild a truncated variants_dict for the next step
+            variants_dict = {name: variants_dict[name] for name in option_names}
+
+        # If there are no variants or a single variant with no options, create a single default one
+        if not option_names:
+            variants.append({"price": base_price, "sku": "default-sku", "option1": "Default Title"})
+            return options, variants
 
         # Create the 'options' array
         for name, values in variants_dict.items():
@@ -520,55 +590,75 @@ try:
 
         # Generate the Cartesian product of all variant values
         def generate_combinations(keys, index, current_combination):
+            if len(variants) >= max_variants:
+                return
+
             if index == len(keys):
-                variants.append(current_combination)
+                variant_object = {
+                    "price": base_price,
+                    "sku": f"mercury-{'-'.join(current_combination.values())}"
+                }
+                for i, value in enumerate(current_combination.values()):
+                    variant_object[f"option{i+1}"] = value
+                variants.append(variant_object)
                 return
 
             current_key = keys[index]
             for value in variants_dict[current_key]:
+                if len(variants) >= max_variants:
+                    break
                 new_combination = current_combination.copy()
                 new_combination[f"option{index + 1}"] = value
                 generate_combinations(keys, index + 1, new_combination)
 
         generate_combinations(option_names, 0, {})
 
-        # Add price to each variant
-        for variant in variants:
-            variant["price"] = "1.00"  # Default price, you might want to customize this
-
         return options, variants
 
 
-    @app.post("/shopify/export", status_code=status.HTTP_201_CREATED)
-    async def export_to_shopify(
-            product: schemas.ProductData,
-            current_user: dict = Depends(auth.get_current_user)
-    ):
-        logger.info("Trying to export...")
-        user = database.get_user_by_email(current_user["email"])
+    async def _perform_shopify_export(job_id: str, user: dict, product_data: schemas.ProductData):
+        """
+        The actual background task that handles the Shopify export.
+        """
         store_url = user.get("shopify_store_url")
         access_token = user.get("shopify_access_token")
-        logger.info(f"Trying to export: {current_user['email']}, {store_url}, {access_token}")
 
         if not store_url or not access_token:
-            logger.warning(f"Export failed: Shopify credentials not set for user {current_user['email']}")
-            raise HTTPException(
-                status_code=400,
-                detail="Shopify credentials not set. Please complete onboarding."
-            )
+            database.update_job_with_error(job_id, "Shopify credentials not set.")
+            return
 
-        # Generate options and variants from the input data
-        options, variants = generate_shopify_variants(product.variants)
+        # Sanitize the price field
+        try:
+            # Remove any non-digit, non-decimal-point characters
+            clean_price_str = ''.join(c for c in product_data.price if c.isdigit() or c == '.')
+            # Convert to float and back to a 2-decimal string
+            sanitized_price = f"{float(clean_price_str):.2f}"
+        except (ValueError, TypeError):
+            logger.warning(f"Job {job_id}: Invalid price '{product_data.price}'. Defaulting to 0.00.")
+            sanitized_price = "0.00"
+
+        options, variants = generate_shopify_variants(product_data.variants, sanitized_price)
+
+        if len(variants) > 250:
+            logger.error(f"Job {job_id}: Exceeded Shopify's 250 variant limit. Generated {len(variants)} variants.")
+            database.update_job_with_error(job_id,
+                                           "Generated too many variants. Shopify limits products to 250 variants.")
+            return
 
         payload = {
             "product": {
-                "title": product.new_title or product.title or "Untitled",
-                "body_html": product.description or "",
+                "title": product_data.new_title or product_data.title or "Untitled",
+                "body_html": product_data.description or "",
                 "options": options,
                 "variants": variants,
-                "images": [{"src": img} for img in (product.images or [])]
+                "images": [{"src": img} for img in (product_data.images or [])]
             }
         }
+
+        # Log the final payload for debugging
+        logger.info(f"Job {job_id}: Final payload for Shopify API:")
+        logger.info(json.dumps(payload, indent=2))
+        logger.info("--- End Payload Log ---")
 
         try:
             async with httpx.AsyncClient() as client:
@@ -577,20 +667,48 @@ try:
                     "Content-Type": "application/json",
                     "X-Shopify-Access-Token": access_token
                 }
-                resp = await client.post(url, headers=headers, json=payload, timeout=60.0)
+                resp = await client.post(url, headers=headers, json=payload, timeout=120.0)
                 resp.raise_for_status()
 
-            logger.info(f"Successfully exported product to Shopify for user: {current_user['email']}")
-            return {"status": "success", "product": resp.json()}
+            database.update_job_with_result(ObjectId(job_id), {"status": "completed", "product": resp.json()})
+            logger.info(f"Job {job_id}: Successfully exported product to Shopify.")
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error during Shopify export for {current_user['email']}: {e.response.text}")
-            raise HTTPException(status_code=e.response.status_code, detail=f"Shopify API error: {e.response.text}")
+            logger.error(f"HTTP error during Shopify export for job {job_id}: {e.response.text}")
+            database.update_job_with_error(ObjectId(job_id), f"Shopify API error: {e.response.text}")
         except httpx.TimeoutException:
-            logger.error("Timeout during Shopify export.")
-            raise HTTPException(status_code=504, detail="Shopify export timed out.")
+            logger.error(f"Job {job_id}: Timeout during Shopify export.")
+            database.update_job_with_error(ObjectId(job_id), "Shopify export timed out.")
         except Exception as e:
-            logger.error(f"Unexpected error during Shopify export for {current_user['email']}: {e}")
-            raise HTTPException(status_code=500, detail="An internal server error occurred during export.")
+            logger.error(f"Job {job_id}: Unexpected error during Shopify export: {e}")
+            database.update_job_with_error(ObjectId(job_id), f"An internal server error occurred during export: {str(e)}")
+
+
+    @app.post("/shopify/export", status_code=status.HTTP_202_ACCEPTED)
+    async def export_to_shopify(
+            product: schemas.ProductData,
+            current_user: dict = Depends(auth.get_current_user)
+    ):
+        logger.info("Starting new Shopify export job.")
+        user = database.get_user_by_email(current_user["email"])
+        store_url = user.get("shopify_store_url")
+        access_token = user.get("shopify_access_token")
+
+        if not store_url or not access_token:
+            raise HTTPException(
+                status_code=400,
+                detail="Shopify credentials not set. Please complete onboarding."
+            )
+
+        # Create a new job in the database and return the job ID immediately
+        job_id = database.create_shopify_export_job(current_user["email"], product.model_dump())
+
+        # Start the background task
+        asyncio.create_task(_perform_shopify_export(job_id, user, product))
+
+        return {"message": "Shopify export job started", "job_id": job_id}
+
+
+    logger.info("🟢 FastAPI app initialization complete. Server is ready.")
 
 
 except Exception as e:
