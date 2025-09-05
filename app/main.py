@@ -5,6 +5,8 @@ import stripe
 import os
 import httpx
 import json
+from urllib.parse import urljoin, urlparse
+from typing import List
 from fastapi import FastAPI, Depends, HTTPException, status, Request, requests, Body
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,31 +52,71 @@ try:
         return [serialize_doc(doc) for doc in docs]
 
 
-    def scrape_images_only(url: str) -> List[str]:
+    def extract_product_data(html_content: str, base_url: str) -> dict:
+        """
+        Extracts key product data from HTML using heuristics.
+        Returns a dictionary with extracted data.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        data = {
+            "original_title": "Untitled Product",
+            "images": [],
+            "variants": {"default": ["Default"]},
+            "price": "N/A",
+            "category": "Uncategorized",
+            "availability": True,
+        }
 
-        try:
-            response = httpx.get(url, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+        # 1. Extract Images
+        imgs = soup.find_all('img')
+        for img in imgs:
+            src = img.get('src')
+            if src:
+                absolute_url = urljoin(base_url, src)
+                if urlparse(absolute_url).scheme in ["http", "https"]:
+                    data["images"].append(absolute_url)
 
-            image_urls = []
-            image_tags = soup.find_all('img')
+        # 2. Extract Title (look for meta tags or h1)
+        title_tag = soup.find('meta', property='og:title')
+        if not title_tag:
+            title_tag = soup.find('h1')
+        if title_tag and title_tag.get('content'):
+            data["original_title"] = title_tag.get('content').strip()
+        elif title_tag and title_tag.string:
+            data["original_title"] = title_tag.string.strip()
 
-            for img in image_tags:
-                src = img.get('src')
-                if src:
-                    absolute_url = urljoin(url, src)
-                    if urlparse(absolute_url).scheme in ['http', 'https']:
-                        image_urls.append(absolute_url)
+        # 3. Extract Price (look for meta tags or common classes)
+        price_tag = soup.find('meta', property='og:price:amount')
+        if not price_tag:
+            price_tag = soup.find(class_=lambda x: x and ('price' in x.lower() or 'current-price' in x.lower()))
+        if price_tag and price_tag.get('content'):
+            data["price"] = price_tag.get('content').strip()
+        elif price_tag and price_tag.string:
+            data["price"] = price_tag.string.strip()
 
-            return image_urls
+        # 4. Extract Variants (heuristic, very site-specific)
+        variants = {}
+        for select_tag in soup.find_all('select'):
+            option_name = select_tag.get('aria-label') or select_tag.get('name') or 'Option'
+            options = [opt.string.strip() for opt in select_tag.find_all('option') if opt.string]
+            if options:
+                variants[option_name] = options
+        if variants:
+            data['variants'] = variants
 
-        except httpx.RequestError as e:
-            print(f"Scraper Error: Failed to access URL {url}. Reason: {e}")
-            return []
-        except Exception as e:
-            print(f"Scraper Error: An unexpected error occurred during scraping: {e}")
-            return []
+        # 5. Extract Availability (heuristic, by text content)
+        availability_text = soup.find(text=lambda x: x and ("out of stock" in x.lower() or "indisponibil" in x.lower()))
+        if availability_text:
+            data['availability'] = False
+
+        # 6. Extract Category (heuristic, from breadcrumbs)
+        breadcrumbs = soup.find(class_=lambda x: x and ('breadcrumbs' in x.lower() or 'breadcrumb' in x.lower()))
+        if breadcrumbs:
+            category_links = breadcrumbs.find_all('a')
+            if category_links:
+                data['category'] = category_links[-1].text.strip()
+
+        return data
 
 
     # --- Pydantic Models ---
@@ -102,7 +144,8 @@ try:
     stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
     YOUR_DOMAIN = os.environ.get("FRONTEND_URL", "http://localhost:3000")
     STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+    BROWSER_API_WSS = os.environ.get("BROWSER_API_WSS")
+    SCRAPE_DO_API = os.environ.get("SCRAPE_DO_API")
     logger.info("✅ Stripe config loaded.")
 
     PRICE_IDS = {
@@ -280,43 +323,26 @@ try:
             url = request.source_url
             logger.info(f"Job {job_id}: Extracting data from URL: {url}")
 
-            # Step 1: Scrape images
-            scraped_images = scrape_images_only(url)
-            logger.info(f"Job {job_id}: Image scraping successful")
+            # Step 1: Clean the URL and scrape content
+            parsed_url = urlparse(url)
+            clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
 
-            # Step 2: Gemini extraction
             async with httpx.AsyncClient() as client:
-                gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={GEMINI_API_KEY}"
-                gemini_response_schema = {
-                    "type": "OBJECT",
-                    "properties": {
-                        "title": {"type": "STRING"},
-                        "variants": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "price": {"type": "STRING"},
-                        "category": {"type": "STRING"},
-                        "availability": {"type": "BOOLEAN"}
-                    },
-                    "propertyOrdering": ["title", "variants", "price", "category", "availability"]
-                }
-                gemini_payload = {
-                    "contents": [{"parts": [{"text": f"Extract structured data from the product page URL: {url}"}]}],
-                    "generationConfig": {"responseMimeType": "application/json",
-                                         "responseSchema": gemini_response_schema}
-                }
-                gemini_resp = await client.post(gemini_api_url, json=gemini_payload, timeout=30.0)
-                gemini_resp.raise_for_status()
-                gemini_data_str = gemini_resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[
-                    0].get("text")
-                if not gemini_data_str:
-                    raise HTTPException(status_code=500, detail="Gemini API returned no data")
-                gemini_data = json.loads(gemini_data_str)
-                logger.info(f"Job {job_id}: Gemini extraction successful")
+                scrape_do_url = f"https://api.scrape.do/?url={clean_url}&token={SCRAPE_DO_API}&render=true"
+                logger.info(f"Job {job_id}: Making Scrape.do API call to {scrape_do_url}")
+                scrape_resp = await client.get(scrape_do_url, timeout=30.0)
+                scrape_resp.raise_for_status()
 
-            # Step 3: OpenAI copywriting
+                # Extract all data from the HTML
+                extracted_data = extract_product_data(scrape_resp.text, clean_url)
+
+            logger.info(f"Job {job_id}: Product data extraction successful.")
+
+            # Step 2: OpenAI copywriting
             openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
             openai_prompt = f"""
-                Act as an expert Shopify copywriter. Transform the raw product data into a compelling product page description and title.
-                Raw data: {json.dumps(gemini_data, indent=2)}
+                Act as an expert Shopify copywriter. Transform the raw product data into a compelling product page description and new title. Make it sound professional and user-friendly. 
+                Raw data: {json.dumps(extracted_data, indent=2)}
                 Return JSON with keys: 'new_title', 'description', 'benefits_list'.
             """
             openai_resp = openai_client.chat.completions.create(
@@ -330,37 +356,32 @@ try:
             openai_data = json.loads(openai_resp.choices[0].message.content)
             logger.info(f"Job {job_id}: OpenAI generation successful")
 
-            # Gemini returns a list like ["50 ML", "100 ML"]
-            gemini_variants = gemini_data.get("variants", [])
-
-            # Wrap it in a dict for Pydantic
-            variants_dict = {"Option": gemini_variants}
-
-            # Step 4: Combine data
+            # Step 3: Combine data
             final_response_data = {
-                "original_title": gemini_data.get("title", "Untitled Product"),
+                "original_title": extracted_data.get("original_title", "Untitled Product"),
                 "new_title": openai_data.get("new_title", "Untitled Product"),
                 "description": openai_data.get("description", ""),
-                "images": scraped_images,
-                "variants": variants_dict,
-                "price": gemini_data.get("price", "N/A"),
-                "category": gemini_data.get("category", "Uncategorized"),
-                "availability": gemini_data.get("availability", False)
+                "images": extracted_data.get("images", []),
+                "variants": extracted_data.get("variants", {}),
+                "price": extracted_data.get("price", "N/A"),
+                "category": extracted_data.get("category", "Uncategorized"),
+                "availability": extracted_data.get("availability", False)
             }
 
-            # Step 5: Update job with results
+            # Step 4: Update job with results
             database.update_job_with_result(ObjectId(job_id), final_response_data)
             logger.info(f"Job {job_id}: Completed successfully")
 
             response = {
-                "original_title": gemini_data.get("title", "Untitled Product"),
+                "original_title": extracted_data.get("original_title", "Untitled Product"),
                 "new_title": openai_data.get("new_title", "Untitled Product"),
                 "description": openai_data.get("description", ""),
-                "images": scraped_images,
-                "variants": gemini_variants,  # list for API
-                "price": gemini_data.get("price", "N/A"),
-                "category": gemini_data.get("category", "Uncategorized"),
-                "availability": gemini_data.get("availability", False)
+                "images": extracted_data.get("images", []),
+                "variants": list(extracted_data.get("variants", {}).values())[0] if extracted_data.get("variants",
+                                                                                                       {}) else [],
+                "price": extracted_data.get("price", "N/A"),
+                "category": extracted_data.get("category", "Uncategorized"),
+                "availability": extracted_data.get("availability", False)
             }
             return response
 
@@ -516,6 +537,7 @@ try:
             variant["price"] = "1.00"  # Default price, you might want to customize this
 
         return options, variants
+
 
     @app.post("/shopify/export", status_code=status.HTTP_201_CREATED)
     async def export_to_shopify(
