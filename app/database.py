@@ -2,6 +2,8 @@ import os
 
 from dotenv import load_dotenv
 from pathlib import Path
+
+from pydantic import EmailStr
 from pymongo import MongoClient, ReturnDocument
 from bson.objectid import ObjectId
 from datetime import datetime, timezone
@@ -28,8 +30,6 @@ jobs_collection = db.get_collection("jobs")
 users_collection = db.get_collection("users")
 users_collection.create_index("email", unique=True)  # Ensure unique emails
 
-
-# --- Job Functions ---
 def create_scraping_job(url: str, user_email: str) -> str:
     job = {
         "url": url,
@@ -74,13 +74,11 @@ def update_job_with_result(job_id: ObjectId, product_data: dict):
         {"$set": {"status": "completed", "result": product_data}}
     )
 
-
 def update_job_with_error(job_id: ObjectId, error_message: str):
     jobs_collection.update_one(
         {"_id": job_id},
         {"$set": {"status": "failed", "error": error_message}}
     )
-
 
 def create_user(user_data: dict):
     print("Trying to create user:", user_data)
@@ -93,9 +91,8 @@ def create_user(user_data: dict):
         return None
 
 
-def get_user_by_email(email: str):
+def get_user_by_email(email: EmailStr):
     return users_collection.find_one({"email": email})
-
 
 def update_user_subscription(email: str, stripe_customer_id: str, stripe_subscription_id: str, plan: str):
     users_collection.update_one(
@@ -108,13 +105,11 @@ def update_user_subscription(email: str, stripe_customer_id: str, stripe_subscri
         }}
     )
 
-
 def reset_monthly_usage(email: str, current_month: str):
     users_collection.update_one(
         {"email": email},
         {"$set": {"pages_generated_month": 0, "current_month": current_month}}
     )
-
 
 def increment_user_monthly_usage(email: str):
     users_collection.update_one(
@@ -122,13 +117,11 @@ def increment_user_monthly_usage(email: str):
         {"$inc": {"pages_generated_month": 1}}
     )
 
-
 def increment_brand_voice_usage(email: str):
     users_collection.update_one(
         {"email": email},
         {"$inc": {"brand_voice_used": 1}}
     )
-
 
 def get_jobs_by_user(user_email: str):
     jobs = list(jobs_collection.find({"user_email": user_email}).sort("created_at", -1))
@@ -169,17 +162,3 @@ def update_user_shopify_credentials(email: str, store_url: str, access_token: st
             "shopify_access_token": access_token
         }}
     )
-
-
-def create_shopify_export_job(user_email: str, product_data: dict) -> str:
-    """Creates a new Shopify export job and returns its ID."""
-    job = {
-        "user_email": user_email,
-        "type": "shopify_export",
-        "status": "pending",
-        "result": product_data,
-        "error": None,
-        "created_at": datetime.now(timezone.utc),
-    }
-    result = db.jobs.insert_one(job)
-    return str(result.inserted_id)

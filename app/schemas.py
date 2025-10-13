@@ -7,17 +7,49 @@ class ScrapeRequest(BaseModel):
     source_url: HttpUrl
 
 class ProductData(BaseModel):
-    title: Optional[str] = None
+    new_title: str = None
     price: Optional[str] = None
+    category: Optional[str] = None
     images: List[str] = []
     variants: Dict[str, List[str]] = {}
     description: Optional[str] = None
     benefits_list: Optional[List[str]] = None
 
+class ProductPartialUpdate(BaseModel):
+    new_title: Optional[str] = None
+    description: Optional[str] = None
+    images: Optional[List[str]] = None
+    variants: Optional[Dict[str, List[str]]] = None
+    price: Optional[str] = None
+    category: Optional[str] = None
+    availability: Optional[bool] = None
+
+class AdVariation(BaseModel):
+    id: str
+    headline: str
+    description: str
+    cta: str
+    template: str
+
+class AdFormat(BaseModel):
+    id: str
+    name: str
+    platform: str
+    dimensions: str
+    aspect_ratio: str
+
+class GeneratedAdSet(BaseModel):
+    id: str
+    product_id: str
+    format: AdFormat
+    variations: List[AdVariation] = []
+    status: str  # generating | ready | failed
+    created_at: Optional[str] = None
+
 class Job(BaseModel):
     id: str = Field(..., alias="_id")
     user_email: str
-    type: str  # This is a required field
+    type: str
     status: str
     url: Optional[str] = None
     result: Optional[ProductData] = None
@@ -28,8 +60,6 @@ class Job(BaseModel):
         populate_by_name = True
         arbitrary_types_allowed = True
 
-
-
 class Config:
         populate_by_name = True
         arbitrary_types_allowed = True
@@ -38,6 +68,7 @@ class UserCreate(BaseModel):
     first_name: str
     email: EmailStr
     password: str
+    supabase_id: Optional[str] = None
 
 class UserInDB(BaseModel):
     first_name: str
@@ -52,6 +83,7 @@ class UserInDB(BaseModel):
     stripe_subscription_id: Optional[str] = None
     shopify_store_url: Optional[str] = None
     shopify_access_token: Optional[str] = None
+    supabase_id: Optional[str] = None
 
 class Token(BaseModel):
     access_token: str
@@ -72,6 +104,7 @@ class UserInfo(BaseModel):
     stripe_subscription_id: Optional[str] = None
     shopify_store_url: Optional[str] = None
     shopify_access_token: Optional[str] = None
+    is_verified: Optional[bool] = None
 
 class BrandVoiceAnalyzeRequest(BaseModel):
     description: str
@@ -85,3 +118,6 @@ class BrandProfileUpdate(BaseModel):
     description: str
     example_text: str | None = None
     keywords: list[str]
+
+class GoogleToken(BaseModel):
+    id_token: str
