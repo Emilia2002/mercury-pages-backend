@@ -34,14 +34,13 @@ try:
     load_dotenv(dotenv_path=env_path)
     logger.info("✅ .env file loaded.")
     app = FastAPI(title="Mercury Pages API")
+
     def serialize_doc(doc):
-        if doc and "_id" in doc:
-            doc["_id"] = str(doc["_id"])
+        if not doc:
+            return None
+        doc["id"] = str(doc["_id"])
+        doc.pop("_id", None)
         return doc
-
-
-    def serialize_docs(docs):
-        return [serialize_doc(doc) for doc in docs]
 
     def extract_images(soup: BeautifulSoup, base_url: str) -> list[str]:
         images = set()
@@ -500,12 +499,11 @@ try:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
 
-
     @app.get("/jobs", response_model=list[schemas.Job])
     def list_jobs(current_user: dict = Depends(auth.get_current_user)):
         jobs = database.get_jobs_by_user(current_user["email"])
         print(f"Trying to get jobs for...{current_user.get('email')}")
-        return serialize_docs(jobs)
+        return [serialize_doc(job) for job in jobs]
 
 
     @app.get("/me", response_model=schemas.UserInfo)

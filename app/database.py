@@ -44,14 +44,22 @@ def create_scraping_job(url: str, user_email: str) -> str:
     return str(result.inserted_id)
 
 
+from datetime import datetime
+from bson import ObjectId
+
 def get_job_by_id(job_id: str):
     job = jobs_collection.find_one({"_id": ObjectId(job_id)})
-    if job:
-        # Convert ObjectId and datetime to strings for serialization
-        job['_id'] = str(job['_id'])
-        if isinstance(job.get('created_at'), datetime):
-            job['created_at'] = job['created_at'].isoformat()
+    if not job:
+        return None
+
+    job["id"] = str(job["_id"])
+    job.pop("_id", None)
+
+    if isinstance(job.get("created_at"), datetime):
+        job["created_at"] = job["created_at"].isoformat()
+
     return job
+
 
 
 def get_next_pending_job():
