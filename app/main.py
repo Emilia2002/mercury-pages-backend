@@ -3,6 +3,7 @@ import random
 import traceback
 from datetime import datetime, timezone
 from itertools import product
+from app.auth import get_password_hash
 import stripe
 import os
 import httpx
@@ -202,11 +203,6 @@ try:
 
         return data
 
-
-    def generate_otp_code():
-        return str(random.randint(100000, 999999))
-
-
     # --- Pydantic Models ---
     class ShopifyCredentials(BaseModel):
         store_url: str
@@ -228,6 +224,10 @@ try:
         benefits_list: list[str]
         availability: bool
 
+
+    def safe_hash_password(password: str):
+        truncated = password[:72]
+        return get_password_hash(truncated)
 
     stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
     YOUR_DOMAIN = os.environ.get("FRONTEND_URL", "http://localhost:3000")
@@ -282,7 +282,7 @@ try:
 
             user_data = {
                 "first_name": user.first_name, "email": user.email,
-                "hashed_password": auth.get_password_hash(user.password),
+                "hashed_password": safe_hash_password(auth.get_password_hash(user.password)),
                 "subscription_plan": "free",
                 "subscription_active": False,
                 "pages_generated_month": 0,
