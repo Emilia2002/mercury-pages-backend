@@ -279,9 +279,12 @@ try:
             if existing_user:
                 raise HTTPException(status_code=400, detail="Email already registered")
 
+            password_to_hash = user.password[:72]
+            hashed_password = auth.get_password_hash(password_to_hash)
+
             user_data = {
                 "first_name": user.first_name, "email": user.email,
-                "hashed_password": safe_hash_password(auth.get_password_hash(user.password)),
+                "hashed_password": hashed_password,
                 "subscription_plan": "free",
                 "subscription_active": False,
                 "pages_generated_month": 0,
