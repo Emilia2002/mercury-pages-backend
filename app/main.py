@@ -35,12 +35,16 @@ try:
     logger.info("✅ .env file loaded.")
     app = FastAPI(title="Mercury Pages API")
 
+
     def serialize_doc(doc):
-        if not doc:
-            return None
-        doc["id"] = str(doc["_id"])
-        doc.pop("_id", None)
+        if doc and "_id" in doc:
+            doc["_id"] = str(doc["_id"])
         return doc
+
+
+    def serialize_docs(docs):
+        return [serialize_doc(doc) for doc in docs]
+
 
     def extract_images(soup: BeautifulSoup, base_url: str) -> list[str]:
         images = set()
@@ -106,6 +110,7 @@ try:
 
         return normalized
 
+
     def normalize_variants_for_shopify(variants_dict):
         options = []
         option_names = list(variants_dict.keys())
@@ -119,6 +124,8 @@ try:
 
 
     from urllib.parse import urlparse
+
+
     def clean_image_url(url: str) -> Optional[str]:
 
         if not url:
@@ -195,16 +202,20 @@ try:
 
         return data
 
+
     def generate_otp_code():
         return str(random.randint(100000, 999999))
+
 
     # --- Pydantic Models ---
     class ShopifyCredentials(BaseModel):
         store_url: str
         access_token: str
 
+
     class AIExtractRequest(BaseModel):
         source_url: str
+
 
     class AIExtractResponse(BaseModel):
         original_title: str
@@ -253,11 +264,13 @@ try:
     )
     logger.info(f"✅ CORS configured for origins: {origins}")
 
+
     # --- Endpoints ---
     @app.get("/")
     def read_root():
         logger.info("GET / route called")
         return {"message": "Server is running!"}
+
 
     @app.post("/register", response_model=schemas.UserInDB)
     def register_user(user: schemas.UserCreate):
@@ -291,6 +304,7 @@ try:
             traceback.print_exc()
             raise HTTPException(status_code=500, detail="Internal server error during registration.")
 
+
     @app.post("/token", response_model=schemas.Token)
     def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
         logger.info(f"POST /token called for username: {form_data.username}")
@@ -308,11 +322,14 @@ try:
             access_token = auth.create_access_token(data={"sub": user['email']})
             return {"access_token": access_token, "token_type": "bearer"}
         except Exception as e:
+            raise
+        except Exception as e:
             logger.error(f"CRITICAL ERROR in /token endpoint: {e}")
             traceback.print_exc()
             raise HTTPException(status_code=500, detail="An internal server error occurred during login.")
 
-    @app.post("/google-login", response_model = schemas.Token)
+
+    @app.post("/google-login", response_model=schemas.Token)
     async def google_login(token_data: schemas.GoogleToken):
         google_user_info = None
         try:
@@ -353,7 +370,7 @@ try:
                     "name": name,
                     "is_google_user": True
                 }
-                database.create_user(new_user_data) # Save the user in the db
+                database.create_user(new_user_data)  # Save the user in the db
                 user = database.get_user_by_email(email)
             access_token = auth.create_access_token(data={"sub": user['email']})
             return {"access_token": access_token, "token_type": "bearer"}
@@ -361,6 +378,7 @@ try:
         except Exception as e:
             traceback.print_exc()
             raise HTTPException(status_code=500, detail="An internal server error occurred during Google sign-in.")
+
 
     @app.post("/create-checkout-session")
     def create_checkout_session(checkout_request: schemas.CheckoutRequest,
@@ -381,6 +399,7 @@ try:
             return {"url": session.url}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
 
     @app.post("/stripe-webhook")
     async def stripe_webhook(request: Request):
@@ -405,13 +424,16 @@ try:
                 database.update_user_subscription(email, stripe_customer_id, stripe_subscription_id, plan)
         return {"status": "success"}
 
+
     @app.post("/ai-extract-data", response_model=AIExtractResponse)
     async def extract_data_with_ai(request: AIExtractRequest, current_user: dict = Depends(auth.get_current_user)):
         email = current_user.get("email")
         user = database.get_user_by_email(email)
         logger.info(f"User limits: {user.get('pages_generated_month', 0)}/{FREE_PLAN_LIMIT} pages used this month.")
-        if user.get("subscription_plan", "free").lower() == "free" and user.get("pages_generated_month", 0) >= FREE_PLAN_LIMIT:
-            logger.warning(f"User {email} exceeded plan limit ({user.get("pages_generated_month", 0)}/{FREE_PLAN_LIMIT}). Raising 403.")
+        if user.get("subscription_plan", "free").lower() == "free" and user.get("pages_generated_month",
+                                                                                0) >= FREE_PLAN_LIMIT:
+            logger.warning(
+                f"User {email} exceeded plan limit ({user.get("pages_generated_month", 0)}/{FREE_PLAN_LIMIT}). Raising 403.")
             raise HTTPException(
                 status_code=403,
                 detail=f"You have exceeded your limit of {FREE_PLAN_LIMIT} pages for the month. Please upgrade your plan."
@@ -419,25 +441,25 @@ try:
 
         job_id = database.create_scraping_job(request.source_url, email)
         try:
-                url = request.source_url
-                logger.info(f"Job {job_id}: Extracting data from URL: {url}")
+            url = request.source_url
+            logger.info(f"Job {job_id}: Extracting data from URL: {url}")
 
-                parsed_url = urlparse(url)
-                clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+            parsed_url = urlparse(url)
+            clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
 
-                async with httpx.AsyncClient() as client:
-                    scrape_do_url = f"https://api.scrape.do/?url={clean_url}&token={SCRAPE_DO_API}&render=true"
-                    logger.info(f"Job {job_id}: Making Scrape.do API call to {scrape_do_url}")
-                    scrape_resp = await client.get(scrape_do_url, timeout=60.0)
-                    scrape_resp.raise_for_status()
-                    extracted_data = extract_product_data(scrape_resp.text, clean_url)
+            async with httpx.AsyncClient() as client:
+                scrape_do_url = f"https://api.scrape.do/?url={clean_url}&token={SCRAPE_DO_API}&render=true"
+                logger.info(f"Job {job_id}: Making Scrape.do API call to {scrape_do_url}")
+                scrape_resp = await client.get(scrape_do_url, timeout=60.0)
+                scrape_resp.raise_for_status()
+                extracted_data = extract_product_data(scrape_resp.text, clean_url)
 
-                logger.info(f"Job {job_id}: Product data extraction successful.")
-                openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-                openai_prompt = f"""
+            logger.info(f"Job {job_id}: Product data extraction successful.")
+            openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            openai_prompt = f"""
                 You are an expert Shopify product page generator.
                 Take the raw product data and generate a **Shopify-ready product object**.
-    
+
                 Tasks:
                 1. Rewrite the product title into something unique, attractive, and keyword-friendly.
                 2. Write a persuasive long-form product description (with emojis if relevant).
@@ -445,10 +467,10 @@ try:
                 4. If the category is missing or 'Uncategorized', infer the best category (e.g. 'Electronics', 'Fashion', 'Home & Kitchen', 'Sports', etc.).
                 5. If variants are missing or only 'default', analyze the data and guess meaningful variants (size, color, material, style, etc.).
                 6. Always return **valid JSON**.
-    
+
                 Raw extracted data:
                 {json.dumps(extracted_data, indent=2)}
-    
+
                 Return JSON with keys:
                 - new_title
                 - description
@@ -457,39 +479,39 @@ try:
                 - variants
                 """
 
-                openai_resp = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant that outputs JSON."},
-                        {"role": "user", "content": openai_prompt}
-                    ]
-                )
-                openai_data = json.loads(openai_resp.choices[0].message.content)
-                logger.info(f"Job {job_id}: OpenAI generation successful")
+            openai_resp = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that outputs JSON."},
+                    {"role": "user", "content": openai_prompt}
+                ]
+            )
+            openai_data = json.loads(openai_resp.choices[0].message.content)
+            logger.info(f"Job {job_id}: OpenAI generation successful")
 
-                final_response_data = {
-                    "original_title": extracted_data.get("original_title", "Untitled Product"),
-                    "new_title": openai_data.get("new_title", "Untitled Product"),
-                    "description": openai_data.get("description", ""),
-                    "images": extracted_data.get("images", []),
-                    "variants": normalize_variants(openai_data.get("variants") or extracted_data.get("variants", {})),
-                    "price": extracted_data.get("price", "N/A"),
-                    "category": openai_data.get("category", "Uncategorized"),
-                    "benefits_list": openai_data.get("benefits_list", []),
-                    "availability": extracted_data.get("availability", False),
-                }
+            final_response_data = {
+                "original_title": extracted_data.get("original_title", "Untitled Product"),
+                "new_title": openai_data.get("new_title", "Untitled Product"),
+                "description": openai_data.get("description", ""),
+                "images": extracted_data.get("images", []),
+                "variants": normalize_variants(openai_data.get("variants") or extracted_data.get("variants", {})),
+                "price": extracted_data.get("price", "N/A"),
+                "category": openai_data.get("category", "Uncategorized"),
+                "benefits_list": openai_data.get("benefits_list", []),
+                "availability": extracted_data.get("availability", False),
+            }
 
-                database.update_job_with_result(ObjectId(job_id), final_response_data)
-                database.increment_user_monthly_usage(email)
-                logger.info(f"Job {job_id}: Completed successfully")
+            database.update_job_with_result(ObjectId(job_id), final_response_data)
+            database.increment_user_monthly_usage(email)
+            logger.info(f"Job {job_id}: Completed successfully")
 
-                return final_response_data
+            return final_response_data
 
         except Exception as e:
-                logger.error(f"Job {job_id}: Failed with error: {e}")
-                database.update_job_with_error(ObjectId(job_id), str(e))
-                raise HTTPException(status_code=500, detail=f"AI extraction failed: {str(e)}")
+            logger.error(f"Job {job_id}: Failed with error: {e}")
+            database.update_job_with_error(ObjectId(job_id), str(e))
+            raise HTTPException(status_code=500, detail=f"AI extraction failed: {str(e)}")
 
 
     @app.get("/jobs/{job_id}", response_model=schemas.Job)
@@ -499,11 +521,12 @@ try:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
 
+
     @app.get("/jobs", response_model=list[schemas.Job])
     def list_jobs(current_user: dict = Depends(auth.get_current_user)):
         jobs = database.get_jobs_by_user(current_user["email"])
         print(f"Trying to get jobs for...{current_user.get('email')}")
-        return [serialize_doc(job) for job in jobs]
+        return serialize_docs(jobs)
 
 
     @app.get("/me", response_model=schemas.UserInfo)
@@ -630,6 +653,7 @@ try:
 
         return options, variants
 
+
     async def _perform_shopify_export(job_id: str, user: dict, product_data: schemas.ProductData):
         store_url = user.get("shopify_store_url")
         access_token = user.get("shopify_access_token")
@@ -650,7 +674,7 @@ try:
         if len(variants) > 250:
             logger.error(f"Job {job_id}: Exceeded Shopify's 250 variant limit. Generated {len(variants)} variants.")
             database.update_shopify_export_job_with_error(job_id,
-                                           "Generated too many variants. Shopify limits products to 250 variants.")
+                                                          "Generated too many variants. Shopify limits products to 250 variants.")
             return
 
         images = [{"src": clean_image_url(img)} for img in (product_data.images or []) if clean_image_url(img)]
@@ -691,7 +715,8 @@ try:
             database.update_shopify_export_job_with_error(ObjectId(job_id), "Shopify export timed out.")
         except Exception as e:
             logger.error(f"Job {job_id}: Unexpected error during Shopify export: {e}")
-            database.update_shopify_export_job_with_error(ObjectId(job_id), f"An internal server error occurred during export: {str(e)}")
+            database.update_shopify_export_job_with_error(ObjectId(job_id),
+                                                          f"An internal server error occurred during export: {str(e)}")
 
 
     @app.post("/users/me/shopify", status_code=status.HTTP_200_OK)
