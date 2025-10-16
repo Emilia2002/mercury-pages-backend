@@ -429,8 +429,7 @@ try:
         email = current_user.get("email")
         user = database.get_user_by_email(email)
         logger.info(f"User limits: {user.get('pages_generated_month', 0)}/{FREE_PLAN_LIMIT} pages used this month.")
-        if user.get("subscription_plan", "free").lower() == "free" and user.get("pages_generated_month",
-                                                                                0) >= FREE_PLAN_LIMIT:
+        if user.get("subscription_plan", "free").lower() == "free" and user.get("pages_generated_month",0) >= FREE_PLAN_LIMIT:
             logger.warning(
                 f"User {email} exceeded plan limit ({user.get("pages_generated_month", 0)}/{FREE_PLAN_LIMIT}). Raising 403.")
             raise HTTPException(
@@ -447,7 +446,7 @@ try:
             clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
 
             async with httpx.AsyncClient() as client:
-                scrape_do_url = f"https://api.scrape.do/?url={clean_url}&token={SCRAPE_DO_API}&render=true"
+                scrape_do_url = f"https://api.scrape.do/?url={clean_url}&token={SCRAPE_DO_API}&render=true&super=true"
                 logger.info(f"Job {job_id}: Making Scrape.do API call to {scrape_do_url}")
                 scrape_resp = await client.get(scrape_do_url, timeout=60.0)
                 scrape_resp.raise_for_status()
