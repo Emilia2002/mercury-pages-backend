@@ -3,27 +3,25 @@ import traceback
 from datetime import datetime, timezone
 from itertools import product
 from app.auth import get_password_hash
+from urllib.parse import urlparse
 import stripe
 import os
 import httpx
 import json
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 from typing import List, Optional, Dict, Any, Tuple
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Body
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
 from bs4 import BeautifulSoup
 from openai import OpenAI
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from bson import ObjectId
-from google.oauth2 import id_token
-from google.auth.transport import requests
 import app.database as database
 import app.schemas as schemas
 import app.auth as auth
-import app.ai_generator as ai_generator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -32,19 +30,15 @@ logger.info("--- Starting main.py initialization ---")
 try:
     env_path = Path(__file__).resolve().parent.parent / '.env'
     load_dotenv(dotenv_path=env_path)
-    logger.info("✅ .env file loaded.")
     app = FastAPI(title="Mercury Pages API")
-
 
     def serialize_doc(doc):
         if doc and "_id" in doc:
             doc["_id"] = str(doc["_id"])
         return doc
 
-
     def serialize_docs(docs):
         return [serialize_doc(doc) for doc in docs]
-
 
     def extract_images(soup: BeautifulSoup, base_url: str) -> list[str]:
         images = set()
@@ -66,7 +60,6 @@ try:
                     match = re.search(r'window\.runParams\s*=\s*(\{.*\});', script.string, re.DOTALL)
                     if match:
                         data = json.loads(match.group(1))
-                        # AliExpress stores product images under multiple possible keys
                         gallery = data.get("data", {}).get("imageModule", {}).get("imagePathList", [])
                         if gallery:
                             for img_url in gallery:
@@ -75,7 +68,6 @@ try:
                     pass
 
         return list(images)
-
 
     def normalize_variants(variants_raw: Any) -> Dict[str, List[str]]:
         normalized = {}
@@ -110,21 +102,14 @@ try:
 
         return normalized
 
-
     def normalize_variants_for_shopify(variants_dict):
         options = []
-        option_names = list(variants_dict.keys())
 
-        # Build Shopify options
         for name, values in variants_dict.items():
             cleaned_values = [v.split(":")[-1].strip() if ":" in v else v for v in values]
             options.append({"name": name, "values": cleaned_values})
 
         return options
-
-
-    from urllib.parse import urlparse
-
 
     def clean_image_url(url: str) -> Optional[str]:
 
@@ -152,65 +137,97 @@ try:
         return url
 
 
+    import json
+    import re
+    from bs4 import BeautifulSoup
+    from urllib.parse import urljoin
+
+
     def extract_product_data(html_content: str, base_url: str) -> dict:
-        soup = BeautifulSoup(html_content, 'html.parser')
+        soup = BeautifulSoup(html_content, "html.parser")
+
         data = {
             "original_title": "Untitled Product",
             "images": [],
-            "variants": {"default": ["Default"]},
             "price": "N/A",
-            "category": "Uncategorized",
+            "rating": "N/A",
             "availability": True,
+            "variants": {"default": ["Default"]},
+            "category": "Uncategorized",
+            "platform": "generic"
         }
 
         data["images"] = extract_images(soup, base_url)
 
-        title_tag = soup.find('meta', property='og:title')
-        if not title_tag:
-            title_tag = soup.find('h1')
-        if title_tag and title_tag.get('content'):
-            data["original_title"] = title_tag.get('content').strip()
-        elif title_tag and title_tag.string:
-            data["original_title"] = title_tag.string.strip()
+        # --- 🛒 AMAZON HANDLER ---
+        if "amazon." in base_url:
+            data["platform"] = "amazon"
 
-        price_tag = soup.find('meta', property='og:price:amount')
-        if not price_tag:
-            price_tag = soup.find(class_=lambda x: x and ('price' in x.lower() or 'current-price' in x.lower()))
-        if price_tag and price_tag.get('content'):
-            data["price"] = price_tag.get('content').strip()
-        elif price_tag and price_tag.string:
-            data["price"] = price_tag.string.strip()
+            # Product Title
+            title_tag = soup.find(id="productTitle")
+            if title_tag and title_tag.text.strip():
+                data["original_title"] = title_tag.text.strip()
 
-        variants = {}
-        for select_tag in soup.find_all('select'):
-            option_name = select_tag.get('aria-label') or select_tag.get('name') or 'Option'
-            options = [opt.string.strip() for opt in select_tag.find_all('option') if opt.string]
-            if options:
-                variants[option_name] = options
-        if variants:
-            data['variants'] = variants
+            # Price
+            if soup.find("div", id="outOfStockBuyBox_feature_div"):
+                data["price"] = "Out of Stock"
+                data["availability"] = False
 
-        availability_text = soup.find(text=lambda x: x and ("out of stock" in x.lower() or "unavailable" in x.lower()))
-        if availability_text:
-            data['availability'] = False
+            else:
+                whole = soup.find(class_="a-price-whole")
+                fraction = soup.find(class_="a-price-fraction")
+                if whole and fraction:
+                    data["price"] = f"${whole.text.strip()}{fraction.text.strip()}"
+                else:
+                    # Fallback to meta tag
+                    price_meta = soup.find("span", class_="a-price")
+                    if price_meta and price_meta.text.strip():
+                        data["price"] = price_meta.text.strip()
 
-        breadcrumbs = soup.find(class_=lambda x: x and ('breadcrumbs' in x.lower() or 'breadcrumb' in x.lower()))
-        if breadcrumbs:
-            category_links = breadcrumbs.find_all('a')
-            if category_links:
-                data['category'] = category_links[-1].text.strip()
+            # Rating
+            rating_div = soup.find("span", {"data-hook": "rating-out-of-text"})
+            if rating_div and rating_div.text.strip():
+                data["rating"] = rating_div.text.strip()
+            else:
+                # Fallback for "AverageCustomerReviews"
+                rating_div = soup.find(id="averageCustomerReviews")
+                if rating_div and rating_div.text.strip():
+                    data["rating"] = rating_div.text.strip()
+
+            # Variants (color/size)
+            variants = {}
+            for variant in soup.select("ul.a-unordered-list li"):
+                text = variant.get_text(strip=True)
+                if text:
+                    variants.setdefault("options", []).append(text)
+            if variants:
+                data["variants"] = variants
+
+        # --- 🌍 GENERIC FALLBACK ---
+        if data["original_title"] == "Untitled Product":
+            title_tag = soup.find("meta", property="og:title") or soup.find("h1")
+            if title_tag:
+                if title_tag.get("content"):
+                    data["original_title"] = title_tag["content"].strip()
+                elif title_tag.text:
+                    data["original_title"] = title_tag.text.strip()
+
+        breadcrumb = soup.find(class_=lambda x: x and "breadcrumb" in x.lower())
+        if breadcrumb:
+            links = breadcrumb.find_all("a")
+            if links:
+                data["category"] = links[-1].text.strip()
 
         return data
+
 
     # --- Pydantic Models ---
     class ShopifyCredentials(BaseModel):
         store_url: str
         access_token: str
 
-
     class AIExtractRequest(BaseModel):
         source_url: str
-
 
     class AIExtractResponse(BaseModel):
         original_title: str
@@ -249,6 +266,7 @@ try:
     origins = [
         "http://127.0.0.1:3000",
         "http://localhost:3000",
+        "http://localhost:3001",
         "http://localhost:3003",
         "https://mercury-pages-frontend.vercel.app",
         "https://mercurypages.ai",
@@ -321,62 +339,60 @@ try:
             access_token = auth.create_access_token(data={"sub": user['email']})
             return {"access_token": access_token, "token_type": "bearer"}
         except Exception as e:
-            raise
-        except Exception as e:
             logger.error(f"CRITICAL ERROR in /token endpoint: {e}")
             traceback.print_exc()
             raise HTTPException(status_code=500, detail="An internal server error occurred during login.")
 
 
-    @app.post("/google-login", response_model=schemas.Token)
-    async def google_login(token_data: schemas.GoogleToken):
-        google_user_info = None
-        try:
-            request = requests.Request()
-            google_user_info = id_token.verify_oauth2_token(
-                token_data.id_token,
-                request,
-                GOOGLE_CLIENT_ID
-            )
-            logger.info(f"GOOGLE LOGIN SUCCESS: {id_token}")
-            logger.info(f"GOOGLE LOGIN: {google_user_info}")
-
-        except ValueError as e:
-            logger.warning(f"Google token validation failed: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or Expired Google ID Token",
-            )
-
-        except Exception as e:
-            logger.error(f"Error during token validation: {e}")
-            raise HTTPException(status_code=500, detail="Internal server error during token validation.")
-
-        email = google_user_info.get("email")
-        name = google_user_info.get("name")
-        is_verified = google_user_info.get("email_verified")
-
-        if not email or not is_verified:
-            raise HTTPException(status_code=400, detail="Invalid email address.")
-
-        try:
-            user = database.get_user_by_email(email)
-
-            if not user:
-                # Create user
-                new_user_data = {
-                    "email": email,
-                    "name": name,
-                    "is_google_user": True
-                }
-                database.create_user(new_user_data)  # Save the user in the db
-                user = database.get_user_by_email(email)
-            access_token = auth.create_access_token(data={"sub": user['email']})
-            return {"access_token": access_token, "token_type": "bearer"}
-
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail="An internal server error occurred during Google sign-in.")
+    # @app.post("/google-login", response_model=schemas.Token)
+    # async def google_login(token_data: schemas.GoogleToken):
+    #
+    #     try:
+    #         request = requests.Request()
+    #         google_user_info = id_token.verify_oauth2_token(
+    #             token_data.id_token,
+    #             request,
+    #             GOOGLE_CLIENT_ID
+    #         )
+    #         logger.info(f"GOOGLE LOGIN SUCCESS: {id_token}")
+    #         logger.info(f"GOOGLE LOGIN: {google_user_info}")
+    #
+    #     except ValueError as e:
+    #         logger.warning(f"Google token validation failed: {e}")
+    #         raise HTTPException(
+    #             status_code=status.HTTP_401_UNAUTHORIZED,
+    #             detail="Invalid or Expired Google ID Token",
+    #         )
+    #
+    #     except Exception as e:
+    #         logger.error(f"Error during token validation: {e}")
+    #         raise HTTPException(status_code=500, detail="Internal server error during token validation.")
+    #
+    #     email = google_user_info.get("email")
+    #     name = google_user_info.get("name")
+    #     is_verified = google_user_info.get("email_verified")
+    #
+    #     if not email or not is_verified:
+    #         raise HTTPException(status_code=400, detail="Invalid email address.")
+    #
+    #     try:
+    #         user = database.get_user_by_email(email)
+    #
+    #         if not user:
+    #             # Create user
+    #             new_user_data = {
+    #                 "email": email,
+    #                 "name": name,
+    #                 "is_google_user": True
+    #             }
+    #             database.create_user(new_user_data)  # Save the user in the db
+    #             user = database.get_user_by_email(email)
+    #         access_token = auth.create_access_token(data={"sub": user['email']})
+    #         return {"access_token": access_token, "token_type": "bearer"}
+    #
+    #     except Exception as e:
+    #         traceback.print_exc()
+    #         raise HTTPException(status_code=500, detail="An internal server error occurred during Google sign-in.")
 
 
     @app.post("/create-checkout-session")
@@ -447,7 +463,6 @@ try:
 
             async with httpx.AsyncClient() as client:
                 scrape_do_url = f"https://api.scrape.do/?url={clean_url}&token={SCRAPE_DO_API}&render=true&super=true"
-                logger.info(f"Job {job_id}: Making Scrape.do API call to {scrape_do_url}")
                 scrape_resp = await client.get(scrape_do_url, timeout=60.0)
                 scrape_resp.raise_for_status()
                 extracted_data = extract_product_data(scrape_resp.text, clean_url)
@@ -462,7 +477,7 @@ try:
                 1. Rewrite the product title into something unique, attractive, and keyword-friendly.
                 2. Write a persuasive long-form product description (with emojis if relevant).
                 3. Create a short **benefits list** in bullet points.
-                4. If the category is missing or 'Uncategorized', infer the best category (e.g. 'Electronics', 'Fashion', 'Home & Kitchen', 'Sports', etc.).
+                4. If the category is missing or 'Uncategorized', infer the best category for the product (e.g. 'Electronics', 'Fashion', 'Home & Kitchen', 'Sports', etc.).
                 5. If variants are missing or only 'default', analyze the data and guess meaningful variants (size, color, material, style, etc.).
                 6. Always return **valid JSON**.
 
@@ -519,13 +534,11 @@ try:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
 
-
     @app.get("/jobs", response_model=list[schemas.Job])
     def list_jobs(current_user: dict = Depends(auth.get_current_user)):
         jobs = database.get_jobs_by_user(current_user["email"])
         print(f"Trying to get jobs for...{current_user.get('email')}")
         return serialize_docs(jobs)
-
 
     @app.get("/me", response_model=schemas.UserInfo)
     def get_current_user_info(current_user: dict = Depends(auth.get_current_user)):
@@ -544,31 +557,6 @@ try:
             "shopify_access_token": user.get("shopify_access_token")
         }
 
-
-    @app.post("/brand-voice/analyze", response_model=schemas.BrandVoiceAnalyzeResponse)
-    def analyze_brand_voice(request: schemas.BrandVoiceAnalyzeRequest,
-                            current_user: dict = Depends(auth.get_current_user)):
-        email = current_user.get("email")
-        user = database.get_user_by_email(email)
-        if user.get("subscription_plan", "free") == "free" and user.get("brand_voice_used", 0) >= BRAND_VOICE_LIMIT:
-            raise HTTPException(status_code=403, detail="You have used your free brand voice analysis. Please upgrade.")
-
-        database.increment_brand_voice_usage(email)
-        analysis_result = ai_generator.analyze_brand_description(request.description)
-        if not analysis_result:
-            raise HTTPException(status_code=500, detail="AI analysis failed.")
-        return analysis_result
-
-
-    @app.post("/users/me/brand-profile")
-    def save_brand_profile(profile: schemas.BrandProfileUpdate, current_user: dict = Depends(auth.get_current_user)):
-        """Saves the complete brand profile for the authenticated user."""
-        user_email = current_user.get("email")
-        profile_data = profile.model_dump()
-        database.update_user_brand_profile(user_email, profile_data)
-        return {"status": "success", "message": "Brand profile saved successfully."}
-
-
     @app.post("/create-customer-portal-session")
     def create_customer_portal_session(current_user: dict = Depends(auth.get_current_user)):
         user = database.get_user_by_email(current_user["email"])
@@ -583,7 +571,6 @@ try:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-
     @app.post("/cancel-subscription")
     def cancel_subscription(current_user: dict = Depends(auth.get_current_user)):
         user = database.get_user_by_email(current_user["email"])
@@ -596,7 +583,6 @@ try:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-
     def generate_shopify_variants(variants_dict: Dict[str, List[str]]) -> Tuple[List[dict], List[dict]]:
         max_options = 3
         max_variants = 250
@@ -608,12 +594,9 @@ try:
             )
 
         option_names = list(variants_dict.keys())[:max_options]
-
         cleaned_variants_dict = {}
-
         for name in option_names:
             values = variants_dict.get(name, [])
-
             cleaned_values = []
             for v in values:
                 if not v:
@@ -626,10 +609,8 @@ try:
             cleaned_variants_dict[name] = unique_values
 
         options = [{"name": name, "values": values} for name, values in cleaned_variants_dict.items()]
-
         all_keys = list(cleaned_variants_dict.keys())
         all_values = [cleaned_variants_dict[k] for k in all_keys]
-
         variants = []
         seen_combos = set()
 
@@ -651,14 +632,9 @@ try:
 
         return options, variants
 
-
     async def _perform_shopify_export(job_id: str, user: dict, product_data: schemas.ProductData):
         store_url = user.get("shopify_store_url")
         access_token = user.get("shopify_access_token")
-
-        if not store_url or not access_token:
-            database.update_shopify_export_job_with_error(ObjectId(job_id), "Shopify credentials not set.")
-            return
 
         try:
             clean_price_str = ''.join(c for c in product_data.price if c.isdigit() or c == '.')
@@ -668,12 +644,6 @@ try:
             sanitized_price = "0.00"
 
         options, variants = generate_shopify_variants(product_data.variants, sanitized_price)
-
-        if len(variants) > 250:
-            logger.error(f"Job {job_id}: Exceeded Shopify's 250 variant limit. Generated {len(variants)} variants.")
-            database.update_shopify_export_job_with_error(job_id,
-                                                          "Generated too many variants. Shopify limits products to 250 variants.")
-            return
 
         images = [{"src": clean_image_url(img)} for img in (product_data.images or []) if clean_image_url(img)]
 
@@ -703,19 +673,13 @@ try:
                 resp = await client.post(url, headers=headers, json=payload, timeout=120.0)
                 resp.raise_for_status()
 
-            database.update_shopify_export_job_with_result(ObjectId(job_id), {"product": resp.json()})
             logger.info(f"Job {job_id}: Successfully exported product to Shopify.")
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error during Shopify export for job {job_id}: {e.response.text}")
-            database.update_shopify_export_job_with_error(ObjectId(job_id), f"Shopify API error: {e.response.text}")
         except httpx.TimeoutException:
             logger.error(f"Job {job_id}: Timeout during Shopify export.")
-            database.update_shopify_export_job_with_error(ObjectId(job_id), "Shopify export timed out.")
         except Exception as e:
             logger.error(f"Job {job_id}: Unexpected error during Shopify export: {e}")
-            database.update_shopify_export_job_with_error(ObjectId(job_id),
-                                                          f"An internal server error occurred during export: {str(e)}")
-
 
     @app.post("/users/me/shopify", status_code=status.HTTP_200_OK)
     async def save_shopify_credentials(
@@ -737,7 +701,6 @@ try:
         except Exception as e:
             logger.error(f"Error saving Shopify credentials for {current_user['email']}: {e}")
             raise HTTPException(status_code=500, detail="Internal server error saving credentials.")
-
 
     @app.patch("/jobs/{job_id}", status_code=status.HTTP_200_OK)
     def update_job_result(
@@ -770,13 +733,12 @@ try:
             traceback.print_exc()
             raise HTTPException(status_code=500, detail="Failed to update job result")
 
-
     @app.post("/shopify/export", status_code=status.HTTP_200_OK)
     async def export_to_shopify(
             product: schemas.ProductData,
             current_user: dict = Depends(auth.get_current_user)
     ):
-        logger.info(f"Received product data: {product.dict()}")
+        logger.info(f"Received product data: {product.model_dump()}")
         user = database.get_user_by_email(current_user["email"])
         store_url = user.get("shopify_store_url")
         access_token = user.get("shopify_access_token")
@@ -787,7 +749,6 @@ try:
                 detail="Shopify credentials not set. Please complete onboarding."
             )
 
-        # --- Price sanitization ---
         try:
             clean_price_str = ''.join(c for c in product.price if c.isdigit() or c == '.')
             sanitized_price = f"{float(clean_price_str):.2f}"
@@ -805,7 +766,7 @@ try:
         payload = {
             "product": {
                 "title": product.new_title or getattr(product, "original_title", None) or "Untitled Product",
-                "body_html": product.description or "",
+                "body_html": product.description + product.benefits_list,
                 "price": product.price or "0.00",
                 "options": options,
                 "variants": variants,
@@ -816,7 +777,6 @@ try:
         logger.info("Payload for Shopify:")
         logger.info(json.dumps(payload, indent=2))
 
-        # --- Call Shopify API ---
         try:
             async with httpx.AsyncClient() as client:
                 url = f"https://{store_url}/admin/api/{os.environ.get('SHOPIFY_API_VERSION', '2023-07')}/products.json"
@@ -842,10 +802,6 @@ try:
         except Exception as e:
             logger.error(f"Unexpected error during Shopify export: {e}")
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-
-    logger.info("🟢 FastAPI app initialization complete. Server is ready.")
-
 
 except Exception as e:
     logger.error("❌ CRITICAL STARTUP ERROR:")

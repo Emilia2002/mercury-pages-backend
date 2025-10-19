@@ -98,7 +98,6 @@ def create_user(user_data: dict):
         print("❌ Failed to create user:", e)
         return None
 
-
 def get_user_by_email(email: EmailStr):
     return users_collection.find_one({"email": email})
 
