@@ -766,7 +766,7 @@ try:
         payload = {
             "product": {
                 "title": product.new_title or getattr(product, "original_title", None) or "Untitled Product",
-                "body_html": product.description + product.benefits_list,
+                "body_html": product.description,
                 "price": product.price or "0.00",
                 "options": options,
                 "variants": variants,
