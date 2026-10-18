@@ -7,8 +7,6 @@ from urllib.parse import urlparse
 import stripe
 import os
 import httpx
-import json
-from urllib.parse import urljoin
 from typing import List, Optional, Dict, Any, Tuple
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordRequestForm
@@ -249,8 +247,7 @@ try:
     YOUR_DOMAIN = os.environ.get("FRONTEND_URL", "http://localhost:3000")
     STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
     BROWSER_API_WSS = os.environ.get("BROWSER_API_WSS")
-    SCRAPE_DO_API = os.environ.get("SCRAPE_DO_API")
-    logger.info("✅ Stripe config loaded.")
+    FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY")
     GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 
     PRICE_IDS = {
@@ -440,6 +437,67 @@ try:
         return {"status": "success"}
 
 
+    async def scrape_product_page_with_firecrawl(url: str) -> str:
+        endpoint = "https://api.firecrawl.dev/v2/scrape"
+
+        headers = {
+            "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "url": url,
+            "formats": ["html", "markdown"],
+            "onlyMainContent": False,
+            "timeout": 60000,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=75.0) as client:
+                response = await client.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+
+            result = response.json()
+
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Firecrawl returned HTTP {exc.response.status_code}. "
+                    "Check your API key, credits, and request."
+                ),
+            ) from exc
+
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Could not connect to the Firecrawl API.",
+            ) from exc
+
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail="Firecrawl could not scrape this product page.",
+            )
+
+        data = result.get("data") or {}
+        html = data.get("html")
+
+        if not html or not html.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Firecrawl returned no HTML for this page. "
+                    "Try another product URL."
+                ),
+            )
+
+        return html
+
     @app.post("/ai-extract-data", response_model=AIExtractResponse)
     async def extract_data_with_ai(request: AIExtractRequest, current_user: dict = Depends(auth.get_current_user)):
         email = current_user.get("email")
@@ -447,7 +505,7 @@ try:
         logger.info(f"User limits: {user.get('pages_generated_month', 0)}/{FREE_PLAN_LIMIT} pages used this month.")
         if user.get("subscription_plan", "free").lower() == "free" and user.get("pages_generated_month",0) >= FREE_PLAN_LIMIT:
             logger.warning(
-                f"User {email} exceeded plan limit ({user.get("pages_generated_month", 0)}/{FREE_PLAN_LIMIT}). Raising 403.")
+                f"User {email} exceeded plan limit ({user.get('pages_generated_month', 0)}/{FREE_PLAN_LIMIT}). Raising 403.")
             raise HTTPException(
                 status_code=403,
                 detail=f"You have exceeded your limit of {FREE_PLAN_LIMIT} pages for the month. Please upgrade your plan."
@@ -461,11 +519,8 @@ try:
             parsed_url = urlparse(url)
             clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
 
-            async with httpx.AsyncClient() as client:
-                scrape_do_url = f"https://api.scrape.do/?url={clean_url}&token={SCRAPE_DO_API}&render=true&super=true"
-                scrape_resp = await client.get(scrape_do_url, timeout=60.0)
-                scrape_resp.raise_for_status()
-                extracted_data = extract_product_data(scrape_resp.text, clean_url)
+            html = await scrape_product_page_with_firecrawl(clean_url)
+            extracted_data = extract_product_data(html, clean_url)
 
             logger.info(f"Job {job_id}: Product data extraction successful.")
             openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
