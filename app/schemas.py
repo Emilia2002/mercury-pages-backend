@@ -14,6 +14,15 @@ class ProductData(BaseModel):
     variants: Dict[str, List[str]] = {}
     description: Optional[str] = None
     benefits_list: Optional[List[str]] = None
+    job_id: Optional[str] = None
+    idempotency_key: Optional[str] = Field(default=None, min_length=16, max_length=128)
+
+class ShopifyExportResponse(BaseModel):
+    status: str
+    job_id: str
+    shopify_product_id: Optional[str] = None
+    already_exported: bool = False
+
 
 class ProductPartialUpdate(BaseModel):
     new_title: Optional[str] = None
