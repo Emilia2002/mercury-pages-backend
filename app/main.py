@@ -38,6 +38,13 @@ try:
     load_dotenv(dotenv_path=env_path)
     app = FastAPI(title="Mercury Pages API")
 
+    @app.middleware("http")
+    async def log_request(request: Request, call_next):
+        logger.info("[v0] Request started: %s %s", request.method, request.url)
+        response = await call_next(request)
+        logger.info("[v0] Request completed: %s %s -> %s", request.method, request.url.path, response.status_code)
+        return response
+
     def serialize_doc(doc):
         if doc and "_id" in doc:
             doc["_id"] = str(doc["_id"])
@@ -901,9 +908,12 @@ try:
 
     @app.get("/auth/shopify/start")
     def start_shopify_oauth(shop: str, current_user: dict = Depends(auth.get_current_user)):
+        logger.info("[v0] Shopify OAuth start requested: path=/auth/shopify/start shop=%r user=%r", shop, current_user.get("email"))
         if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+            logger.error("[v0] Shopify OAuth configuration missing: client_id=%s client_secret_present=%s", bool(SHOPIFY_CLIENT_ID), bool(SHOPIFY_CLIENT_SECRET))
             raise HTTPException(status_code=503, detail="Shopify OAuth is not configured on the server")
         store_domain = normalize_shopify_domain(shop)
+        logger.info("[v0] Shopify OAuth domain normalized: %s redirect_uri=%s", store_domain, SHOPIFY_REDIRECT_URI)
         nonce = secrets.token_urlsafe(32)
         state = auth.create_access_token({"sub": current_user["email"], "shopify_nonce": nonce, "shop": store_domain})
         params = urlencode({
@@ -916,7 +926,9 @@ try:
 
     @app.get("/auth/shopify/callback")
     async def shopify_oauth_callback(code: str | None = None, shop: str | None = None, state: str | None = None, error: str | None = None):
+        logger.info("[v0] Shopify OAuth callback received: shop=%r code_present=%s state_present=%s error=%r", shop, bool(code), bool(state), error)
         if error:
+            logger.warning("[v0] Shopify OAuth authorization returned an error: %s", error)
             return RedirectResponse(f"{YOUR_DOMAIN}/account?shopify_error=authorization_denied")
         if not code or not shop or not state:
             raise HTTPException(status_code=400, detail="Missing Shopify OAuth parameters")
