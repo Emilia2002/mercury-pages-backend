@@ -9,9 +9,13 @@ import os
 import ipaddress
 import socket
 import hashlib
+import secrets
 import httpx
 from typing import List, Optional, Dict, Any, Tuple
+from urllib.parse import urlencode
+from jose import JWTError, jwt
 from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -282,6 +286,13 @@ try:
     BROWSER_API_WSS = os.environ.get("BROWSER_API_WSS")
     FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY")
     GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+    SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID")
+    SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")
+    SHOPIFY_REDIRECT_URI = os.environ.get(
+        "SHOPIFY_REDIRECT_URI",
+        f"{YOUR_DOMAIN}/auth/shopify/callback",
+    )
+    SHOPIFY_SCOPES = os.environ.get("SHOPIFY_SCOPES", "write_products")
 
     PRICE_IDS = {
         "craftsman": os.environ.get("STRIPE_CRAFTSMAN_PRICE_ID"),
@@ -730,8 +741,7 @@ try:
             "subscription_active": user.get("subscription_active", False),
             "pages_limit_month": limits,
             "pages_generated_month": user.get("pages_generated_month", 0),
-            "shopify_store_url": user.get("shopify_store_url"),
-            "shopify_access_token": user.get("shopify_access_token")
+            "shopify_store_url": user.get("shopify_store_url")
         }
 
     @app.post("/create-customer-portal-session")
@@ -858,6 +868,66 @@ try:
         except Exception as e:
             logger.error(f"Job {job_id}: Unexpected error during Shopify export: {e}")
 
+    def normalize_shopify_domain(store_url: str) -> str:
+        value = store_url.strip().lower()
+        if not value:
+            raise HTTPException(status_code=422, detail="Shopify store domain is required")
+        if "://" not in value:
+            value = f"https://{value}"
+        parsed = urlparse(value)
+        hostname = (parsed.hostname or "").strip().rstrip(".")
+        if not hostname or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise HTTPException(status_code=422, detail="Enter a Shopify store domain such as your-store.myshopify.com")
+        if not hostname.endswith(".myshopify.com"):
+            raise HTTPException(status_code=422, detail="Shopify OAuth requires a .myshopify.com store domain")
+        return hostname
+
+    @app.get("/auth/shopify/start")
+    def start_shopify_oauth(shop: str, current_user: dict = Depends(auth.get_current_user)):
+        if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+            raise HTTPException(status_code=503, detail="Shopify OAuth is not configured on the server")
+        store_domain = normalize_shopify_domain(shop)
+        nonce = secrets.token_urlsafe(32)
+        state = auth.create_access_token({"sub": current_user["email"], "shopify_nonce": nonce, "shop": store_domain})
+        params = urlencode({
+            "client_id": SHOPIFY_CLIENT_ID,
+            "scope": SHOPIFY_SCOPES,
+            "redirect_uri": SHOPIFY_REDIRECT_URI,
+            "state": state,
+        })
+        return {"authorization_url": f"https://{store_domain}/admin/oauth/authorize?{params}"}
+
+    @app.get("/auth/shopify/callback")
+    async def shopify_oauth_callback(code: str | None = None, shop: str | None = None, state: str | None = None, error: str | None = None):
+        if error:
+            return RedirectResponse(f"{YOUR_DOMAIN}/account?shopify_error=authorization_denied")
+        if not code or not shop or not state:
+            raise HTTPException(status_code=400, detail="Missing Shopify OAuth parameters")
+        try:
+            payload = jwt.decode(state, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
+            email = payload.get("sub")
+            if not email or not payload.get("shopify_nonce"):
+                raise JWTError("invalid state")
+            store_domain = normalize_shopify_domain(shop)
+            if payload.get("shop") != store_domain:
+                raise JWTError("shop mismatch")
+        except (JWTError, HTTPException):
+            raise HTTPException(status_code=400, detail="Invalid or expired Shopify OAuth state")
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            token_response = await client.post(
+                f"https://{store_domain}/admin/oauth/access_token",
+                json={"client_id": SHOPIFY_CLIENT_ID, "client_secret": SHOPIFY_CLIENT_SECRET, "code": code},
+            )
+        if token_response.status_code >= 400:
+            logger.error("Shopify OAuth token exchange failed: %s", token_response.text)
+            raise HTTPException(status_code=502, detail="Shopify token exchange failed")
+        access_token = token_response.json().get("access_token")
+        if not access_token:
+            raise HTTPException(status_code=502, detail="Shopify did not return an access token")
+        database.update_user_shopify_credentials(email, store_domain, access_token)
+        return RedirectResponse(f"{YOUR_DOMAIN}/account?shopify=connected")
+
     @app.post("/users/me/shopify", status_code=status.HTTP_200_OK)
     async def save_shopify_credentials(
             creds: ShopifyCredentials,
@@ -866,10 +936,11 @@ try:
         logger.info(f"Trying to save: {current_user['email']}")
 
         try:
+            store_domain = normalize_shopify_domain(creds.store_url)
             database.users_collection.update_one(
                 {"email": current_user["email"]},
                 {"$set": {
-                    "shopify_store_url": creds.store_url,
+                    "shopify_store_url": store_domain,
                     "shopify_access_token": creds.access_token
                 }}
             )
