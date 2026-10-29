@@ -672,11 +672,28 @@ try:
         if not database.get_job_by_id(resource_id, email):
             raise HTTPException(status_code=404, detail="Page or generation job not found")
 
+        job = database.get_job_by_id(resource_id, email)
+        product = (job or {}).get("result") or {}
+        product_title = str(product.get("new_title") or product.get("original_title") or request.product_context).strip()
+        product_description = str(product.get("description") or "").strip()
+        product_category = str(product.get("category") or "").strip()
+        product_benefits = product.get("benefits_list") or []
+        product_variants = product.get("variants") or {}
+
+        product_facts = [
+            f"Product name: {product_title}",
+            f"Category: {product_category}" if product_category else "",
+            f"Description: {product_description}" if product_description else "",
+            f"Benefits: {', '.join(str(item) for item in product_benefits[:8])}" if product_benefits else "",
+            f"Variants: {json.dumps(product_variants, ensure_ascii=False)}" if product_variants else "",
+        ]
         prompt_parts = [
-            f"Create a polished {request.purpose} marketing image for this product: {request.product_context}.",
+            f"Create a polished {request.purpose} marketing image for the specific product described below.",
+            "The product identity and physical attributes must remain faithful to the supplied facts. Do not invent a different product, category, packaging, or use case.",
+            "PRODUCT FACTS:\n" + "\n".join(fact for fact in product_facts if fact),
             f"Visual direction: {request.style}.",
             f"Use the {request.template_id} ecommerce template aesthetic.",
-            "Do not include readable text, logos, watermarks, UI, borders, or collages.",
+            "Show the product clearly as the primary subject. Do not include readable text, logos, watermarks, UI, borders, or collages.",
         ]
         if request.instruction:
             prompt_parts.append(f"Additional art direction: {request.instruction}")
