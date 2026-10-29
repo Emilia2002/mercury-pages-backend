@@ -8,6 +8,7 @@ import stripe
 import os
 import ipaddress
 import socket
+import hashlib
 import httpx
 from typing import List, Optional, Dict, Any, Tuple
 from fastapi import FastAPI, Depends, HTTPException, status, Request
@@ -909,75 +910,84 @@ try:
             traceback.print_exc()
             raise HTTPException(status_code=500, detail="Failed to update job result")
 
-    @app.post("/shopify/export", status_code=status.HTTP_200_OK)
+    @app.post("/shopify/export", response_model=schemas.ShopifyExportResponse, status_code=status.HTTP_200_OK)
     async def export_to_shopify(
             product: schemas.ProductData,
             current_user: dict = Depends(auth.get_current_user)
     ):
-        logger.info(f"Received product data: {product.model_dump()}")
-        user = database.get_user_by_email(current_user["email"])
-        store_url = user.get("shopify_store_url")
-        access_token = user.get("shopify_access_token")
+        email = current_user["email"]
+        if not product.job_id or not ObjectId.is_valid(product.job_id):
+            raise HTTPException(status_code=422, detail="job_id is required for Shopify export")
 
+        job = database.get_job_by_id(product.job_id, email)
+        if not job:
+            raise HTTPException(status_code=404, detail="Product page not found")
+        if job.get("status") != "completed":
+            raise HTTPException(status_code=409, detail="Only completed product pages can be exported")
+
+        export_key = product.idempotency_key or hashlib.sha256(
+            f"{product.job_id}:{product.new_title}:{product.description}:{product.images}:{product.variants}".encode()
+        ).hexdigest()
+        existing_export = job.get("shopify_export") or (job.get("result") or {}).get("shopify_export")
+        if existing_export:
+            return {
+                "status": "already_exported",
+                "job_id": product.job_id,
+                "shopify_product_id": existing_export.get("shopify_product_id"),
+                "already_exported": True,
+            }
+
+        user = database.get_user_by_email(email)
+        store_url = user.get("shopify_store_url") if user else None
+        access_token = user.get("shopify_access_token") if user else None
         if not store_url or not access_token:
-            raise HTTPException(
-                status_code=400,
-                detail="Shopify credentials not set. Please complete onboarding."
-            )
+            raise HTTPException(status_code=400, detail="Shopify credentials not set. Please complete onboarding.")
 
         try:
-            clean_price_str = ''.join(c for c in product.price if c.isdigit() or c == '.')
-            sanitized_price = f"{float(clean_price_str):.2f}"
+            clean_price_str = ''.join(c for c in (product.price or "") if c.isdigit() or c == '.')
+            sanitized_price = f"{float(clean_price_str):.2f}" if clean_price_str else "0.00"
         except (ValueError, TypeError):
             sanitized_price = "0.00"
 
-        # --- Variants ---
         options, variants = generate_shopify_variants(product.variants)
         if len(variants) > 250:
             raise HTTPException(status_code=400, detail="Too many variants (Shopify max = 250)")
 
-        images = [{"src": clean_image_url(img)} for img in (product.images or []) if clean_image_url(img)]
-        limited_images = images[:15]
-
-        payload = {
-            "product": {
-                "title": product.new_title or getattr(product, "original_title", None) or "Untitled Product",
-                "body_html": product.description,
-                "price": product.price or "0.00",
-                "options": options,
-                "variants": variants,
-                "images": limited_images,
-            }
-        }
-
-        logger.info("Payload for Shopify:")
-        logger.info(json.dumps(payload, indent=2))
+        limited_images = [{"src": clean_image_url(img)} for img in (product.images or []) if clean_image_url(img)][:15]
+        payload = {"product": {
+            "title": product.new_title or "Untitled Product",
+            "body_html": product.description or "",
+            "variants": variants or [{"price": sanitized_price}],
+            "options": options,
+            "images": limited_images,
+        }}
 
         try:
             async with httpx.AsyncClient() as client:
                 url = f"https://{store_url}/admin/api/{os.environ.get('SHOPIFY_API_VERSION', '2023-07')}/products.json"
-                headers = {
-                    "Content-Type": "application/json",
-                    "X-Shopify-Access-Token": access_token,
-                }
-                resp = await client.post(url, headers=headers, json=payload, timeout=120.0)
+                resp = await client.post(url, headers={"Content-Type": "application/json", "X-Shopify-Access-Token": access_token}, json=payload, timeout=120.0)
                 resp.raise_for_status()
                 shopify_data = resp.json()
 
-            logger.info("✅ Shopify export successful.")
-            return {"status": "success", "product": shopify_data}
-
+            shopify_product_id = str((shopify_data.get("product") or {}).get("id") or "")
+            export_data = {
+                "status": "exported",
+                "shopify_product_id": shopify_product_id or None,
+                "idempotency_key": export_key,
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+            }
+            database.update_job_shopify_export(ObjectId(product.job_id), export_data)
+            return {"status": "success", "job_id": product.job_id, "shopify_product_id": shopify_product_id or None}
         except httpx.HTTPStatusError as e:
             logger.error(f"Shopify API error: {e.response.text}")
-            raise HTTPException(status_code=e.response.status_code, detail=f"Shopify API error: {e.response.text}")
-
-        except httpx.TimeoutException:
-            logger.error("Shopify export timed out.")
-            raise HTTPException(status_code=504, detail="Shopify export timed out.")
-
+            raise HTTPException(status_code=502, detail="Shopify rejected the product export") from e
+        except httpx.TimeoutException as e:
+            raise HTTPException(status_code=504, detail="Shopify export timed out") from e
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Unexpected error during Shopify export: {e}")
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+            logger.exception("Unexpected Shopify export error")
+            raise HTTPException(status_code=500, detail="Shopify export failed") from e
 
 except Exception as e:
     logger.error("❌ CRITICAL STARTUP ERROR:")

@@ -206,6 +206,16 @@ def create_image_asset_record(
     })
 
 
+def update_job_shopify_export(job_id: ObjectId, export_data: dict):
+    jobs_collection.update_one(
+        {"_id": job_id},
+        {"$set": {
+            "shopify_export": export_data,
+            "result.shopify_export": export_data,
+        }}
+    )
+
+
 def update_user_shopify_credentials(email: str, store_url: str, access_token: str):
     users_collection.update_one(
         {"email": email},
