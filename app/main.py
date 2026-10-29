@@ -6,6 +6,8 @@ from app.auth import get_password_hash
 from urllib.parse import urlparse
 import stripe
 import os
+import ipaddress
+import socket
 import httpx
 from typing import List, Optional, Dict, Any, Tuple
 from fastapi import FastAPI, Depends, HTTPException, status, Request
@@ -226,6 +228,8 @@ try:
 
     class AIExtractRequest(BaseModel):
         source_url: str
+        template_id: Optional[str] = None
+        template_config: Dict[str, Any] = {}
 
     class AIExtractResponse(BaseModel):
         original_title: str
@@ -237,7 +241,34 @@ try:
         category: str
         benefits_list: list[str]
         availability: bool
+        template_id: Optional[str] = None
+        page: Dict[str, Any] = {}
 
+
+    TEMPLATE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+    def validate_template(request: AIExtractRequest) -> tuple[str | None, dict]:
+        template_id = request.template_id.strip() if request.template_id else None
+        if template_id and not TEMPLATE_ID_PATTERN.fullmatch(template_id):
+            raise HTTPException(status_code=422, detail="Invalid template_id")
+        if not isinstance(request.template_config, dict):
+            raise HTTPException(status_code=422, detail="template_config must be an object")
+        return template_id, request.template_config
+
+    def validate_source_url(source_url: str) -> str:
+        parsed = urlparse(source_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise HTTPException(status_code=422, detail="source_url must be a valid HTTP(S) URL")
+        hostname = parsed.hostname.lower().rstrip(".")
+        if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
+            raise HTTPException(status_code=422, detail="source_url host is not allowed")
+        try:
+            addresses = {info[4][0] for info in socket.getaddrinfo(hostname, None)}
+            if any(not ipaddress.ip_address(address).is_global for address in addresses):
+                raise HTTPException(status_code=422, detail="source_url host is not publicly routable")
+        except socket.gaierror as exc:
+            raise HTTPException(status_code=422, detail="source_url host could not be resolved") from exc
+        return parsed._replace(fragment="").geturl()
 
     def safe_hash_password(password: str):
         truncated = password[:72]
@@ -501,7 +532,11 @@ try:
     @app.post("/ai-extract-data", response_model=AIExtractResponse)
     async def extract_data_with_ai(request: AIExtractRequest, current_user: dict = Depends(auth.get_current_user)):
         email = current_user.get("email")
+        template_id, template_config = validate_template(request)
+        source_url = validate_source_url(request.source_url)
         user = database.get_user_by_email(email)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authenticated user not found")
         logger.info(f"User limits: {user.get('pages_generated_month', 0)}/{FREE_PLAN_LIMIT} pages used this month.")
         if user.get("subscription_plan", "free").lower() == "free" and user.get("pages_generated_month",0) >= FREE_PLAN_LIMIT:
             logger.warning(
@@ -511,9 +546,9 @@ try:
                 detail=f"You have exceeded your limit of {FREE_PLAN_LIMIT} pages for the month. Please upgrade your plan."
             )
 
-        job_id = database.create_scraping_job(request.source_url, email)
+        job_id = database.create_scraping_job(source_url, email, template_id, template_config)
         try:
-            url = request.source_url
+            url = source_url
             logger.info(f"Job {job_id}: Extracting data from URL: {url}")
 
             parsed_url = urlparse(url)
@@ -536,8 +571,13 @@ try:
                 5. If variants are missing or only 'default', analyze the data and guess meaningful variants (size, color, material, style, etc.).
                 6. Always return **valid JSON**.
 
-                Raw extracted data:
+                Raw extracted product data (preserve these product fields exactly where present):
                 {json.dumps(extracted_data, indent=2)}
+
+                Template context:
+                - template_id: {template_id or "default"}
+                - template_config: {json.dumps(template_config, indent=2)}
+                Use the template context to shape the generated page copy, but never discard the extracted product images, price, availability, or variants.
 
                 Return JSON with keys:
                 - new_title
@@ -568,6 +608,20 @@ try:
                 "category": openai_data.get("category", "Uncategorized"),
                 "benefits_list": openai_data.get("benefits_list", []),
                 "availability": extracted_data.get("availability", False),
+                "template_id": template_id,
+                "page": {
+                    "template_id": template_id,
+                    "title": openai_data.get("new_title", extracted_data.get("original_title", "Untitled Product")),
+                    "description": openai_data.get("description", ""),
+                    "benefits": openai_data.get("benefits_list", []),
+                    "product": {
+                        "title": extracted_data.get("original_title", "Untitled Product"),
+                        "price": extracted_data.get("price", "N/A"),
+                        "images": extracted_data.get("images", []),
+                        "variants": normalize_variants(extracted_data.get("variants", {})),
+                        "availability": extracted_data.get("availability", False),
+                    },
+                },
             }
 
             database.update_job_with_result(ObjectId(job_id), final_response_data)
@@ -584,8 +638,8 @@ try:
 
     @app.get("/jobs/{job_id}", response_model=schemas.Job)
     def get_job_status(job_id: str, current_user: dict = Depends(auth.get_current_user)):
-        job = database.get_job_by_id(job_id)
-        if not job or job.get("user_email") != current_user.get("email"):
+        job = database.get_job_by_id(job_id, current_user.get("email"))
+        if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
 
@@ -766,8 +820,8 @@ try:
 
         logger.info(f"PATCH /jobs/{job_id} called by {current_user.get('email')}")
         try:
-            job = database.get_job_by_id(job_id)
-            if not job or job.get("user_email") != current_user.get("email"):
+            job = database.get_job_by_id(job_id, current_user.get("email"))
+            if not job:
                 logger.warning(f"Job {job_id} not found or unauthorized access by {current_user.get('email')}")
                 raise HTTPException(status_code=404, detail="Job not found")
 
