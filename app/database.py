@@ -28,7 +28,9 @@ db = client.fastpage_db
 
 jobs_collection = db.get_collection("jobs")
 users_collection = db.get_collection("users")
+image_assets_collection = db.get_collection("image_assets")
 users_collection.create_index("email", unique=True)  # Ensure unique emails
+image_assets_collection.create_index([("user_email", 1), ("created_at", -1)])
 
 def create_scraping_job(url: str, user_email: str, template_id: str | None = None, template_config: dict | None = None) -> str:
     job = {
@@ -169,6 +171,39 @@ def update_user_subscription_status(email: str, plan: str, is_active: bool):
             "stripe_subscription_id": None  # <-- Clear the subscription ID
         }}
     )
+
+
+def create_image_asset(asset: dict) -> str:
+    result = image_assets_collection.insert_one(asset)
+    return str(result.inserted_id)
+
+
+def create_image_asset_record(
+    *,
+    user_email: str,
+    page_id: str | None,
+    job_id: str | None,
+    purpose: str,
+    template_id: str,
+    prompt: str,
+    model: str,
+    provider_url: str | None,
+    provider_b64: str | None,
+):
+    return create_image_asset({
+        "user_email": user_email,
+        "page_id": page_id,
+        "job_id": job_id,
+        "source": "generated",
+        "purpose": purpose,
+        "template_id": template_id,
+        "prompt": prompt,
+        "model": model,
+        "provider_url": provider_url,
+        "provider_b64": None,
+        "status": "completed",
+        "created_at": datetime.now(timezone.utc),
+    })
 
 
 def update_user_shopify_credentials(email: str, store_url: str, access_token: str):

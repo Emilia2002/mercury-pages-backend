@@ -106,6 +106,29 @@ class UserInfo(BaseModel):
     shopify_access_token: Optional[str] = None
     is_verified: Optional[bool] = None
 
+class ImageGenerationRequest(BaseModel):
+    page_id: Optional[str] = None
+    job_id: Optional[str] = None
+    product_context: str = Field(..., min_length=1, max_length=2000)
+    purpose: str = Field(..., pattern=r"^(hero|lifestyle|promotional|editorial)$")
+    style: str = Field(..., min_length=1, max_length=160)
+    template_id: str = Field(default="modern-minimal", min_length=1, max_length=64)
+    instruction: Optional[str] = Field(default=None, max_length=600)
+    quantity: int = Field(default=1, ge=1, le=1)
+    size: str = Field(default="1024x1024", pattern=r"^(1024x1024|1536x1024|1024x1536)$")
+    quality: str = Field(default="auto", pattern=r"^(auto|low|medium|high)$")
+
+
+class ImageGenerationResponse(BaseModel):
+    asset_id: str
+    model: str
+    source: str = "generated"
+    url: Optional[str] = None
+    b64_json: Optional[str] = None
+    purpose: str
+    status: str = "completed"
+
+
 class BrandVoiceAnalyzeRequest(BaseModel):
     description: str
 

@@ -22,6 +22,7 @@ from bson import ObjectId
 import app.database as database
 import app.schemas as schemas
 import app.auth as auth
+from app.image_generation import generate_product_image
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -307,7 +308,7 @@ try:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    logger.info(f"✅ CORS configured for origins: {origins}")
+    logger.info(f"��� CORS configured for origins: {origins}")
 
 
     # --- Endpoints ---
@@ -634,6 +635,72 @@ try:
             logger.error(f"Job {job_id}: Failed with error: {e}")
             database.update_job_with_error(ObjectId(job_id), str(e))
             raise HTTPException(status_code=500, detail=f"AI extraction failed: {str(e)}")
+
+
+    @app.post("/image-generation", response_model=schemas.ImageGenerationResponse)
+    def generate_image(
+        request: schemas.ImageGenerationRequest,
+        current_user: dict = Depends(auth.get_current_user),
+    ):
+        email = current_user.get("email")
+        user = database.get_user_by_email(email)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authenticated user not found")
+
+        plan = str(user.get("subscription_plan", "free")).lower()
+        if not user.get("subscription_active") or plan == "free":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="AI image generation is available on paid plans only. Please upgrade your subscription.",
+            )
+
+        resource_id = request.job_id or request.page_id
+        if not resource_id:
+            raise HTTPException(status_code=422, detail="job_id or page_id is required")
+        if not database.get_job_by_id(resource_id, email):
+            raise HTTPException(status_code=404, detail="Page or generation job not found")
+
+        prompt_parts = [
+            f"Create a polished {request.purpose} marketing image for this product: {request.product_context}.",
+            f"Visual direction: {request.style}.",
+            f"Use the {request.template_id} ecommerce template aesthetic.",
+            "Do not include readable text, logos, watermarks, UI, borders, or collages.",
+        ]
+        if request.instruction:
+            prompt_parts.append(f"Additional art direction: {request.instruction}")
+        prompt = " ".join(prompt_parts)
+
+        try:
+            generated = generate_product_image(
+                prompt=prompt,
+                size=request.size,
+                quality=request.quality,
+            )
+            asset_id = database.create_image_asset_record(
+                user_email=email,
+                page_id=request.page_id,
+                job_id=request.job_id,
+                purpose=request.purpose,
+                template_id=request.template_id,
+                prompt=prompt,
+                model=generated["model"],
+                provider_url=generated.get("url"),
+                provider_b64=generated.get("b64_json"),
+            )
+        except RuntimeError as exc:
+            logger.error("Image generation configuration/provider error: %s", exc)
+            raise HTTPException(status_code=503, detail="Image generation is temporarily unavailable") from exc
+        except Exception:
+            logger.exception("Image generation failed for user %s", email)
+            raise HTTPException(status_code=502, detail="The image provider could not generate this image")
+
+        return {
+            "asset_id": asset_id,
+            "model": generated["model"],
+            "url": generated.get("url"),
+            "b64_json": generated.get("b64_json"),
+            "purpose": request.purpose,
+        }
 
 
     @app.get("/jobs/{job_id}", response_model=schemas.Job)
