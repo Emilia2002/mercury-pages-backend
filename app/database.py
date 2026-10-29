@@ -30,11 +30,13 @@ jobs_collection = db.get_collection("jobs")
 users_collection = db.get_collection("users")
 users_collection.create_index("email", unique=True)  # Ensure unique emails
 
-def create_scraping_job(url: str, user_email: str) -> str:
+def create_scraping_job(url: str, user_email: str, template_id: str | None = None, template_config: dict | None = None) -> str:
     job = {
         "url": url,
         "user_email": user_email,
         "type": "scrape",
+        "template_id": template_id,
+        "template_config": template_config or {},
         "status": "pending",
         "result": None,
         "error": None,
@@ -47,8 +49,16 @@ def create_scraping_job(url: str, user_email: str) -> str:
 from datetime import datetime
 from bson import ObjectId
 
-def get_job_by_id(job_id: str):
-    job = jobs_collection.find_one({"_id": ObjectId(job_id)})
+def get_job_by_id(job_id: str, user_email: str | None = None):
+    try:
+        object_id = ObjectId(job_id)
+    except Exception:
+        return None
+
+    query = {"_id": object_id}
+    if user_email:
+        query["user_email"] = user_email
+    job = jobs_collection.find_one(query)
     if not job:
         return None
 

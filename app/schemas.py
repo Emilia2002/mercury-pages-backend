@@ -1,6 +1,6 @@
 # FILE: app/schemas.py
 from pydantic import BaseModel, HttpUrl, EmailStr, Field
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 from datetime import datetime
 
 class ScrapeRequest(BaseModel):
