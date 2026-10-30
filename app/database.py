@@ -27,9 +27,12 @@ except Exception as e:
 db = client.fastpage_db
 
 jobs_collection = db.get_collection("jobs")
+pages_collection = db.get_collection("pages")
 users_collection = db.get_collection("users")
 image_assets_collection = db.get_collection("image_assets")
 users_collection.create_index("email", unique=True)  # Ensure unique emails
+pages_collection.create_index([("owner_email", 1), ("updated_at", -1)])
+pages_collection.create_index([("owner_email", 1), ("job_id", 1)], unique=True)
 image_assets_collection.create_index([("user_email", 1), ("created_at", -1)])
 
 def create_scraping_job(url: str, user_email: str, template_id: str | None = None, template_config: dict | None = None) -> str:
@@ -99,6 +102,74 @@ def update_job_with_error(job_id: ObjectId, error_message: str):
         {"_id": job_id},
         {"$set": {"status": "failed", "error": error_message}}
     )
+
+
+def _serialize_page(page):
+    if not page:
+        return None
+    page["_id"] = str(page["_id"])
+    for key in ("created_at", "updated_at"):
+        if isinstance(page.get(key), datetime):
+            page[key] = page[key].isoformat()
+    return page
+
+
+def create_page_document(*, owner_email: str, job_id: str, page_title: str, template_id: str | None, theme: dict, sections: list):
+    now = datetime.now(timezone.utc)
+    page = {
+        "owner_email": owner_email,
+        "job_id": job_id,
+        "page_title": page_title,
+        "template_id": template_id,
+        "theme": theme,
+        "sections": sections,
+        "schema_version": 1,
+        "revision": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = pages_collection.insert_one(page)
+    page["_id"] = result.inserted_id
+    return _serialize_page(page)
+
+
+def get_page_document(page_id: str, owner_email: str):
+    try:
+        page = pages_collection.find_one({"_id": ObjectId(page_id), "owner_email": owner_email})
+    except Exception:
+        return None
+    return _serialize_page(page)
+
+
+def get_pages_by_user(owner_email: str):
+    return [_serialize_page(page) for page in pages_collection.find({"owner_email": owner_email}).sort("updated_at", -1)]
+
+
+def update_page_document(page_id: str, owner_email: str, revision: int, updates: dict):
+    try:
+        object_id = ObjectId(page_id)
+    except Exception:
+        return None, "not_found"
+    updates = {key: value for key, value in updates.items() if value is not None}
+    updates["updated_at"] = datetime.now(timezone.utc)
+    result = pages_collection.find_one_and_update(
+        {"_id": object_id, "owner_email": owner_email, "revision": revision},
+        {"$set": updates, "$inc": {"revision": 1}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if result:
+        return _serialize_page(result), None
+    exists = pages_collection.find_one({"_id": object_id, "owner_email": owner_email}, {"_id": 1})
+    return (None, "conflict" if exists else "not_found")
+
+
+def delete_page_document(page_id: str, owner_email: str):
+    try:
+        result = pages_collection.delete_one({"_id": ObjectId(page_id), "owner_email": owner_email})
+    except Exception:
+        return False
+    return result.deleted_count == 1
+
 
 def create_user(user_data: dict):
     print("Trying to create user:", user_data)
