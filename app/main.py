@@ -739,6 +739,47 @@ try:
         }
 
 
+    @app.post("/pages", response_model=schemas.PageDocument, status_code=status.HTTP_201_CREATED)
+    def create_page(payload: schemas.PageDocumentCreate, current_user: dict = Depends(auth.get_current_user)):
+        job = database.get_job_by_id(payload.job_id, current_user["email"])
+        if not job:
+            raise HTTPException(status_code=404, detail="Generation job not found")
+        if job.get("status") != "completed":
+            raise HTTPException(status_code=409, detail="Only completed jobs can become editable pages")
+        existing = next((page for page in database.get_pages_by_user(current_user["email"]) if page["job_id"] == payload.job_id), None)
+        if existing:
+            return existing
+        return database.create_page_document(owner_email=current_user["email"], job_id=payload.job_id,
+            page_title=payload.page_title, template_id=payload.template_id,
+            theme=payload.theme, sections=payload.sections)
+
+    @app.get("/pages", response_model=list[schemas.PageDocument])
+    def list_pages(current_user: dict = Depends(auth.get_current_user)):
+        return database.get_pages_by_user(current_user["email"])
+
+    @app.get("/pages/{page_id}", response_model=schemas.PageDocument)
+    def get_page(page_id: str, current_user: dict = Depends(auth.get_current_user)):
+        page = database.get_page_document(page_id, current_user["email"])
+        if not page:
+            raise HTTPException(status_code=404, detail="Page not found")
+        return page
+
+    @app.patch("/pages/{page_id}", response_model=schemas.PageDocument)
+    def update_page(page_id: str, payload: schemas.PageDocumentUpdate, current_user: dict = Depends(auth.get_current_user)):
+        page, error = database.update_page_document(page_id, current_user["email"], payload.revision,
+            payload.model_dump(exclude={"revision"}, exclude_none=True))
+        if error == "not_found":
+            raise HTTPException(status_code=404, detail="Page not found")
+        if error == "conflict":
+            raise HTTPException(status_code=409, detail="Page changed elsewhere; reload before saving")
+        return page
+
+    @app.delete("/pages/{page_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_page(page_id: str, current_user: dict = Depends(auth.get_current_user)):
+        if not database.delete_page_document(page_id, current_user["email"]):
+            raise HTTPException(status_code=404, detail="Page not found")
+        return None
+
     @app.get("/jobs/{job_id}", response_model=schemas.Job)
     def get_job_status(job_id: str, current_user: dict = Depends(auth.get_current_user)):
         job = database.get_job_by_id(job_id, current_user.get("email"))
