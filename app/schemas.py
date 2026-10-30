@@ -24,6 +24,41 @@ class ShopifyExportResponse(BaseModel):
     already_exported: bool = False
 
 
+class PageDocumentCreate(BaseModel):
+    job_id: str
+    page_title: str = Field(default="Untitled page", min_length=1, max_length=200)
+    template_id: Optional[str] = Field(default=None, max_length=64)
+    theme: Dict[str, Any] = Field(default_factory=dict)
+    sections: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class PageDocumentUpdate(BaseModel):
+    page_title: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    template_id: Optional[str] = Field(default=None, max_length=64)
+    theme: Optional[Dict[str, Any]] = None
+    sections: Optional[List[Dict[str, Any]]] = None
+    revision: int = Field(ge=0)
+
+
+class PageDocument(BaseModel):
+    id: str = Field(..., alias="_id")
+    owner_email: str
+    job_id: str
+    page_title: str
+    template_id: Optional[str] = None
+    theme: Dict[str, Any] = Field(default_factory=dict)
+    sections: List[Dict[str, Any]] = Field(default_factory=list)
+    schema_version: int = 1
+    revision: int = 0
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    shopify_export: Optional[Dict[str, Any]] = None
+
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+
+
 class ProductPartialUpdate(BaseModel):
     new_title: Optional[str] = None
     description: Optional[str] = None
